@@ -9,6 +9,7 @@
 #include "shader_frag_drop_shadow.h"
 #include "shader_frag_gradient.h"
 #include "shader_frag_passthrough.h"
+#include "shader_frag_resolve.h"
 #include "shader_frag_texture.h"
 #include "shader_vert.h"
 #include "shader_vert_blur.h"

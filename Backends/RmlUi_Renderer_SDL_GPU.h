@@ -10,6 +10,18 @@
 	#define RMLUI_SDL_GPU_NUM_MSAA_SAMPLES 2
 #endif
 
+// Whether a multisampled layer may be read by a shader. That is what lets the resolve be drawn over a region, the way
+// the reference backend resolves with glBlitFramebuffer under glScissor; without it SDL can only resolve a layer
+// whole, as the store operation of a render pass, and compositing pays for the window rather than for the element.
+//
+// Every released SDL refuses to create a multisample texture with a read flag at all -- SDL_CreateGPUTexture asserts
+// on it -- so this cannot be probed at runtime, and libsdl-org/SDL#15838, which lifts the restriction, is not in a
+// release yet. Hence a build-time switch, defaulting to what every released SDL can do. Once the change ships this
+// becomes a check on SDL_GetVersion() and the switch goes away.
+#ifndef RMLUI_SDL_GPU_SHADER_RESOLVE
+	#define RMLUI_SDL_GPU_SHADER_RESOLVE 0
+#endif
+
 class RenderInterface_SDL_GPU : public Rml::RenderInterface {
 public:
 	RenderInterface_SDL_GPU(SDL_GPUDevice* device, SDL_Window* window);
@@ -274,15 +286,13 @@ private:
 		// Only the layers attach it: the postprocess passes neither test nor write the clip mask, and once the layers
 		// are multisampled the shared buffer no longer matches them in sample count anyway.
 		bool use_depth_stencil = false;
+		// What has been drawn into a postprocess target since it was last transparent everywhere, as a bounding
+		// rectangle. The regional resolve wipes this much rather than the whole target, which is the difference
+		// between clearing the element and clearing the window. Empty means the target holds nothing; a target just
+		// created holds whatever the allocation did, so it starts out dirty in full. Unused on the layers.
+		Rml::Rectanglei dirty;
 	};
 
-	/*
-	    Layers form a stack: geometry is drawn to the top one, and layer zero holds the frame. Targets are reused
-	    rather than destroyed on pop, and everything is recreated when the window size changes.
-
-	    Postprocess targets are separate from the stack and created on first use. Compositing borrows one whenever a
-	    layer cannot be sampled straight into its destination; filters read and write them in turn.
-	*/
 	class RenderLayerStack {
 	public:
 		void Initialize(SDL_GPUDevice* device);
@@ -304,6 +314,14 @@ private:
 		const RenderTarget& GetPostprocessTertiary() { return EnsurePostprocess(2); }
 		const RenderTarget& GetBlendMask() { return EnsurePostprocess(3); }
 		void SwapPostprocessPrimarySecondary();
+
+		// Records that `rect` of the postprocess target holding `texture` has been drawn into. Does nothing for a
+		// texture that is not one of them, which is how the layers are passed over.
+		void MarkPostprocessDirty(SDL_GPUTexture* texture, Rml::Rectanglei rect);
+		// What is left to wipe before the target can stand in for a transparent one. Empty if there is nothing.
+		Rml::Rectanglei GetPostprocessDirty(SDL_GPUTexture* texture) const;
+		// Says outright what the target now holds, for a caller that has just written or wiped it.
+		void SetPostprocessDirty(SDL_GPUTexture* texture, Rml::Rectanglei rect);
 
 		// Created on first use: a document that renders no clip mask never needs it, and on multisampled layers it is
 		// megabytes. Null if it could not be created, which takes clip masks out of service until the next rebuild.
@@ -351,6 +369,7 @@ private:
 		FragBlendMask,
 		FragBlur,
 		FragDropShadow,
+		FragResolve,
 		Count,
 	};
 	static constexpr int num_shaders = static_cast<int>(ShaderId::Count);
@@ -367,6 +386,9 @@ private:
 		BlendMask,
 		Blur,
 		DropShadow,
+		// Resolves a multisampled layer by reading its samples, which lets it be done over a region. Only usable
+		// where the SDL runtime allows a multisample texture to be read; see supports_shader_resolve.
+		Resolve,
 		Count,
 	};
 
@@ -440,6 +462,9 @@ private:
 		uint8_t stencil_reference = 0;
 		SDL_GPUTexture* texture = nullptr;
 		SDL_GPUTexture* mask_texture = nullptr;
+		// The multisampled layer the resolve program reads. Bound as a storage texture rather than through a
+		// sampler, so it travels apart from `texture` and takes no sampler of its own.
+		SDL_GPUTexture* storage_texture = nullptr;
 		// Null to sample with the renderer's default sampler, which repeats. The postprocess passes clamp instead:
 		// they offset and scale texture coordinates, and a wrapped sample would come back from the far edge.
 		SDL_GPUSampler* sampler = nullptr;
@@ -465,7 +490,7 @@ private:
 		Rml::Vector2f uv_scaling);
 	bool DrawPostprocessQuad(const RenderTarget& destination, const DrawState& state);
 	bool DrawTextureToTarget(const RenderTarget& destination, SDL_GPUTexture* source, Blending blend, StencilMode stencil = StencilMode::Off);
-	bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
+bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	bool ResolveTarget(SDL_GPUCommandBuffer* in_command_buffer, const RenderTarget& source, const RenderTarget& destination,
 		bool keep_samples);
 	void BlitRegion(const RenderTarget& destination, const RenderTarget& source, Rml::Rectanglei source_region,
@@ -542,6 +567,7 @@ private:
 	SDL_GPUGraphicsPipeline* bound_pipeline = nullptr;
 	SDL_GPUTexture* bound_texture = nullptr;
 	SDL_GPUTexture* bound_mask_texture = nullptr;
+	SDL_GPUTexture* bound_storage_texture = nullptr;
 	SDL_GPUSampler* bound_sampler = nullptr;
 	SDL_GPUBuffer* bound_vertex_buffer = nullptr;
 	SDL_GPUBuffer* bound_index_buffer = nullptr;

@@ -29,10 +29,14 @@ struct ShaderDefinition {
 	// The ShaderId this row stands for, as an int because the enum is private to the renderer.
 	int id;
 	Span<const byte> data[ShaderFormatCount];
-	// SDL takes the application's word for these rather than deriving them from the blob. They come from the
-	// reflection compile_shaders.py can emit (`-d json`).
+	// The resource counts SDL needs to build the shader. They are not derived from the blob: SDL takes the
+	// application's word for them. They come from the reflection compile_shaders.py can emit (`-d json`), so a shader
+	// that grows a sampler or a constant buffer will disagree here and be caught by the validation layers.
 	int uniforms;
 	int samplers;
+	// Textures read without a sampler. Only the resolve program has one: a multisample texture cannot be filtered,
+	// and its samples are addressed explicitly. They follow the samplers in the same register space.
+	int storage_textures;
 	SDL_GPUShaderStage stage;
 };
 
@@ -51,8 +55,8 @@ struct ShaderDefinition {
 		reinterpret_cast<const byte*>(name), sizeof(name) - 1   \
 	}
 #define SHADER_BLOBS(name) {X(name##_spirv), X_TEXT(name##_msl), X(name##_dxil)}
-#define SHADER_DEF(id, name, uniforms, samplers, stage) \
-	{static_cast<int>(ShaderId::id), SHADER_BLOBS(name), uniforms, samplers, stage}
+#define SHADER_DEF(id, name, uniforms, samplers, storage_textures, stage) \
+	{static_cast<int>(ShaderId::id), SHADER_BLOBS(name), uniforms, samplers, storage_textures, stage}
 
 static SDL_GPUShader* CreateShaderFromMemory(SDL_GPUDevice* device, const ShaderDefinition& shader)
 {
@@ -89,11 +93,32 @@ static SDL_GPUShader* CreateShaderFromMemory(SDL_GPUDevice* device, const Shader
 	info.format = sdl_shader_format;
 	info.stage = shader.stage;
 	info.num_samplers = shader.samplers;
+	info.num_storage_textures = shader.storage_textures;
 	info.num_uniform_buffers = shader.uniforms;
 	SDL_GPUShader* sdl_shader = SDL_CreateGPUShader(device, &info);
 	if (!sdl_shader)
 		Log::Message(Log::LT_ERROR, "Failed to create shader: %s", SDL_GetError());
 	return sdl_shader;
+}
+
+#if RMLUI_SDL_GPU_SHADER_RESOLVE
+// Whether the inner rectangle has nothing outside the outer one. An empty inner is inside anything. Only the regional
+// resolve asks, and a build without it would carry this as an unused function.
+static bool RectContains(Rectanglei outer, Rectanglei inner)
+{
+	if (inner.Width() <= 0 || inner.Height() <= 0)
+		return true;
+	return inner.Left() >= outer.Left() && inner.Top() >= outer.Top() && inner.Right() <= outer.Right() && inner.Bottom() <= outer.Bottom();
+}
+#endif
+
+static Rectanglei RectJoin(Rectanglei a, Rectanglei b)
+{
+	if (a.Width() <= 0 || a.Height() <= 0)
+		return b;
+	if (b.Width() <= 0 || b.Height() <= 0)
+		return a;
+	return a.Join(b);
 }
 
 static Colourf ConvertToColorf(ColourbPremultiplied c0)
@@ -431,9 +456,16 @@ bool RenderInterface_SDL_GPU::RenderLayerStack::CreateTarget(RenderTarget& targe
 	SDL_GPUTextureCreateInfo info{};
 	info.type = SDL_GPU_TEXTURETYPE_2D;
 	info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-	// A multisampled texture holds samples rather than pixels: it cannot be sampled, copied or blitted, only resolved.
+	// A multisampled texture holds samples rather than pixels: it cannot be sampled from, copied from or blitted, and
+	// what reads such a layer is the resolve of it, which lands in a postprocess target. Where the resolve is done by
+	// a shader the layer is read all the same, but as a storage texture -- addressed by texel and sample rather than
+	// filtered. See shader_frag_resolve.frag.
 	if (target_sample_count == SDL_GPU_SAMPLECOUNT_1)
 		info.usage |= SDL_GPU_TEXTUREUSAGE_SAMPLER;
+#if RMLUI_SDL_GPU_SHADER_RESOLVE
+	else
+		info.usage |= SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ;
+#endif
 	info.format = layer_format;
 	info.width = static_cast<Uint32>(width);
 	info.height = static_cast<Uint32>(height);
@@ -449,6 +481,8 @@ bool RenderInterface_SDL_GPU::RenderLayerStack::CreateTarget(RenderTarget& targe
 	}
 
 	SDL_SetGPUTextureName(device, target.color, debug_name);
+	// Nothing has drawn into it yet, but neither is it transparent: a fresh allocation holds whatever it holds.
+	target.dirty = Rectanglei::FromSize({width, height});
 	target.width = width;
 	target.height = height;
 	target.sample_count = target_sample_count;
@@ -589,7 +623,45 @@ void RenderInterface_SDL_GPU::RenderLayerStack::SwapPostprocessPrimarySecondary(
 {
 	EnsurePostprocess(0);
 	EnsurePostprocess(1);
+	// The dirty rectangle travels with the target it describes, which is the whole reason it lives in RenderTarget:
+	// the filter chain swaps these two several times per composite, and what each holds has to follow.
 	std::swap(postprocess[0], postprocess[1]);
+}
+
+void RenderInterface_SDL_GPU::RenderLayerStack::MarkPostprocessDirty(SDL_GPUTexture* texture, Rectanglei rect)
+{
+	if (rect.Width() <= 0 || rect.Height() <= 0)
+		return;
+	for (RenderTarget& target : postprocess)
+	{
+		if (target.color == texture)
+		{
+			target.dirty = RectJoin(target.dirty, rect);
+			return;
+		}
+	}
+}
+
+Rectanglei RenderInterface_SDL_GPU::RenderLayerStack::GetPostprocessDirty(SDL_GPUTexture* texture) const
+{
+	for (const RenderTarget& target : postprocess)
+	{
+		if (target.color == texture)
+			return target.dirty;
+	}
+	return {};
+}
+
+void RenderInterface_SDL_GPU::RenderLayerStack::SetPostprocessDirty(SDL_GPUTexture* texture, Rectanglei rect)
+{
+	for (RenderTarget& target : postprocess)
+	{
+		if (target.color == texture)
+		{
+			target.dirty = rect;
+			return;
+		}
+	}
 }
 
 // -- Setup -------------------------------------------------------------------
@@ -597,18 +669,19 @@ void RenderInterface_SDL_GPU::RenderLayerStack::SwapPostprocessPrimarySecondary(
 SDL_GPUShader* RenderInterface_SDL_GPU::GetShader(ShaderId id)
 {
 	static const ShaderDefinition shader_definitions[] = {
-		SHADER_DEF(VertMain, shader_vert, 2, 0, SDL_GPU_SHADERSTAGE_VERTEX),
-		SHADER_DEF(VertPassthrough, shader_vert_passthrough, 1, 0, SDL_GPU_SHADERSTAGE_VERTEX),
-		SHADER_DEF(VertBlur, shader_vert_blur, 1, 0, SDL_GPU_SHADERSTAGE_VERTEX),
-		SHADER_DEF(FragColor, shader_frag_color, 0, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragTexture, shader_frag_texture, 0, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragGradient, shader_frag_gradient, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragCreation, shader_frag_creation, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragPassthrough, shader_frag_passthrough, 0, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragColorMatrix, shader_frag_color_matrix, 1, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragBlendMask, shader_frag_blend_mask, 0, 2, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragBlur, shader_frag_blur, 1, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
-		SHADER_DEF(FragDropShadow, shader_frag_drop_shadow, 1, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(VertMain, shader_vert, 2, 0, 0, SDL_GPU_SHADERSTAGE_VERTEX),
+		SHADER_DEF(VertPassthrough, shader_vert_passthrough, 1, 0, 0, SDL_GPU_SHADERSTAGE_VERTEX),
+		SHADER_DEF(VertBlur, shader_vert_blur, 1, 0, 0, SDL_GPU_SHADERSTAGE_VERTEX),
+		SHADER_DEF(FragColor, shader_frag_color, 0, 0, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragTexture, shader_frag_texture, 0, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragGradient, shader_frag_gradient, 1, 0, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragCreation, shader_frag_creation, 1, 0, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragPassthrough, shader_frag_passthrough, 0, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragColorMatrix, shader_frag_color_matrix, 1, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragBlendMask, shader_frag_blend_mask, 0, 2, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragBlur, shader_frag_blur, 1, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragDropShadow, shader_frag_drop_shadow, 1, 1, 0, SDL_GPU_SHADERSTAGE_FRAGMENT),
+		SHADER_DEF(FragResolve, shader_frag_resolve, 0, 0, 1, SDL_GPU_SHADERSTAGE_FRAGMENT),
 	};
 	static_assert(sizeof(shader_definitions) / sizeof(shader_definitions[0]) == num_shaders,
 		"shader_definitions needs one row per ShaderId, in ShaderId order");
@@ -654,6 +727,7 @@ RenderInterface_SDL_GPU::ProgramShaders RenderInterface_SDL_GPU::GetProgramShade
 		{ShaderId::VertPassthrough, ShaderId::FragBlendMask},
 		{ShaderId::VertBlur, ShaderId::FragBlur},
 		{ShaderId::VertPassthrough, ShaderId::FragDropShadow},
+		{ShaderId::VertPassthrough, ShaderId::FragResolve},
 	};
 	static_assert(sizeof(program_shaders) / sizeof(program_shaders[0]) == static_cast<int>(ProgramId::Count),
 		"program_shaders needs one row per ProgramId, in ProgramId order");
@@ -1089,6 +1163,7 @@ void RenderInterface_SDL_GPU::InvalidateRenderPassState()
 	bound_pipeline = nullptr;
 	bound_texture = nullptr;
 	bound_mask_texture = nullptr;
+	bound_storage_texture = nullptr;
 	bound_sampler = nullptr;
 	bound_vertex_buffer = nullptr;
 	bound_index_buffer = nullptr;
@@ -1280,6 +1355,7 @@ bool RenderInterface_SDL_GPU::DrawGeometry(const GeometryView& geometry, const D
 		bound_pipeline = pipeline;
 		bound_texture = nullptr;
 		bound_mask_texture = nullptr;
+		bound_storage_texture = nullptr;
 		bound_sampler = nullptr;
 	}
 
@@ -1300,6 +1376,13 @@ bool RenderInterface_SDL_GPU::DrawGeometry(const GeometryView& geometry, const D
 		bound_texture = state.texture;
 		bound_mask_texture = state.mask_texture;
 		bound_sampler = sampler;
+	}
+
+	// Storage textures take a binding of their own, without a sampler. Only the resolve program has one.
+	if (state.storage_texture && state.storage_texture != bound_storage_texture)
+	{
+		SDL_BindGPUFragmentStorageTextures(render_pass, 0, &state.storage_texture, 1);
+		bound_storage_texture = state.storage_texture;
 	}
 
 	if (geometry.vertices.block->buffer != bound_vertex_buffer)
@@ -2432,7 +2515,14 @@ bool RenderInterface_SDL_GPU::DrawPostprocessQuad(const RenderTarget& destinatio
 	if (!FlushGeometryUploads() || !EnsureRenderPass(destination))
 		return false;
 
-	return DrawGeometry(*reinterpret_cast<GeometryView*>(postprocess_quad), quad_state);
+	if (!DrawGeometry(*reinterpret_cast<GeometryView*>(postprocess_quad), quad_state))
+		return false;
+
+	// What was actually written: the quad's rectangle, cut down by the scissor the pass is under.
+	const Rectanglei scissor = GetActiveScissor();
+	const Rectanglei written = Rectanglei::FromCorners(Math::Max(region.p0, scissor.p0), Math::Min(region.p1, scissor.p1));
+	render_layers.MarkPostprocessDirty(destination.color, written);
+	return true;
 }
 
 bool RenderInterface_SDL_GPU::DrawPostprocessQuad(const RenderTarget& destination, const DrawState& state)
@@ -2468,6 +2558,8 @@ bool RenderInterface_SDL_GPU::ResolveTarget(SDL_GPUCommandBuffer* in_command_buf
 		return false;
 	}
 	SDL_EndGPURenderPass(resolve_pass);
+	// The whole attachment is written, so a postprocess target coming out of this holds an image everywhere.
+	render_layers.MarkPostprocessDirty(destination.color, Rectanglei::FromSize({destination.width, destination.height}));
 	frame_num_passes += 1;
 	frame_num_resolves += 1;
 	return true;
@@ -2483,6 +2575,47 @@ bool RenderInterface_SDL_GPU::BlitLayerToPostprocessPrimary(const RenderTarget& 
 
 	if (layer.sample_count == SDL_GPU_SAMPLECOUNT_1)
 		return DrawTextureToTarget(destination, layer.color, Blending::Replace);
+
+#if RMLUI_SDL_GPU_SHADER_RESOLVE
+	// Resolving as a draw is what confines the work to the active scissor -- the region being composited -- rather
+	// than to the whole layer, and that is the whole point of it: the pass resolve below covers the window however
+	// small the element, which on a document of many effects is most of what multisampling costs.
+	//
+	// Falls through to the pass resolve if the draw could not be issued, which is what a missing pipeline or an
+	// unbuilt quad looks like. The layer carries no sampler binding then, but the pass resolve needs none.
+	{
+		// Only the region is about to be written, so whatever the target still holds outside it has to go: leaving
+		// the previous composite there changes eight of the visual tests, while wiping it brings all but one of them
+		// back to byte-for-byte agreement with the pass resolve. What the stale image reaches is not a single draw
+		// one can point at -- every postprocess pass reads no further than the region it writes -- so this is
+		// established by measurement rather than by argument.
+		//
+		// Wiped is only what has been drawn since the target was last transparent, and only when the resolve is not
+		// about to cover it anyway. That is the difference between clearing the element and clearing the window: a
+		// document of many small effects composites each of them into the same target, and clearing all of it every
+		// time costs more than the regional resolve saves.
+		const Rectanglei region = GetActiveScissor();
+		const Rectanglei dirty = render_layers.GetPostprocessDirty(destination.color);
+		if (!RectContains(region, dirty))
+		{
+			SetScissorOverride(dirty);
+			ClearRegion(destination);
+			ClearScissorOverride();
+		}
+
+		DrawState state;
+		state.program = ProgramId::Resolve;
+		state.blend = Blending::Replace;
+		state.storage_texture = layer.color;
+		if (DrawPostprocessQuad(destination, state))
+		{
+			// Everything outside the region is transparent now, whether it was wiped just above or never written.
+			render_layers.SetPostprocessDirty(destination.color, region);
+			frame_num_resolves += 1;
+			return true;
+		}
+	}
+#endif
 
 	// The samples are kept: RmlUi goes on drawing into a layer after compositing it -- a backdrop filter reads the
 	// very layer it is being drawn into -- so dropping them would lose the frame so far.
