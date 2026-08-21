@@ -18,7 +18,8 @@ float4 main(Varyings input) : SV_Target0 {
         float z = t + float(i) * .07;
         l = length(p);
         uv += p / l * (sin(z) + 1.) * abs(sin(l * 9. - z - z));
-        c[i] = .01 / length(glsl_mod(uv, 1.) - .5);
+        // frac() is HLSL's x - floor(x), which is what glsl_mod() computes for a divisor of one, minus the divide.
+        c[i] = .01 / length(frac(uv) - .5);
     }
     return float4(c / l, input.Color.a);
 }
