@@ -313,6 +313,10 @@ private:
 		const RenderTarget& GetPostprocessSecondary() { return EnsurePostprocess(1); }
 		const RenderTarget& GetPostprocessTertiary() { return EnsurePostprocess(2); }
 		const RenderTarget& GetBlendMask() { return EnsurePostprocess(3); }
+		// The tertiary target if something has already needed it, and null otherwise. Unlike the accessors above this
+		// one does not create it: a caller that merely prefers a third target should not be what brings a
+		// window-sized one into existence.
+		const RenderTarget* PeekPostprocessTertiary() const { return postprocess[2].color ? &postprocess[2] : nullptr; }
 		void SwapPostprocessPrimarySecondary();
 
 		// Records that `rect` of the postprocess target holding `texture` has been drawn into. Does nothing for a

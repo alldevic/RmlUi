@@ -2212,10 +2212,36 @@ void RenderInterface_SDL_GPU::RenderBlur(float sigma, const RenderTarget& source
 
 	SetScissorOverride(scissor);
 
-	// Ensure texture data end up in the temp buffer. Depending on the last downscaling, we might need to move it from
-	// the source_destination buffer.
-	if (pass_level % 2 == 0)
-		DrawTextureToTarget(temp, source_destination.color, Blending::Replace);
+	/*
+	    Where the two separable passes read from and write to. The horizontal one has to leave the image in `temp`,
+	    since that is what the upscale below reads, and neither pass can read the target it writes -- so with two
+	    targets the parity of the downscale decides whether a hop is missing.
+
+	    An odd number of downscales leaves the image in `temp` and the pair fits: temp -> source_destination ->
+	    temp. An even number leaves it in `source_destination`, and the same pair would end where it started. That
+	    used to be answered by copying the image across before starting, which is a full draw over the region for
+	    nothing. A third target answers it instead: the vertical pass writes there, and the horizontal one carries
+	    on into `temp` as before.
+
+	    The tertiary target is free unless this blur is the one inside a drop shadow, which is already using it as
+	    its scratch. Then there is nothing to borrow and the copy stands -- as it does when nothing has needed a third
+	    target yet, since bringing a window-sized one into existence to save a draw is not a trade worth making.
+	*/
+	const bool data_in_temp = (pass_level % 2 != 0);
+	const RenderTarget* vertical_source = data_in_temp ? &temp : &source_destination;
+	const RenderTarget* vertical_destination = &source_destination;
+	if (!data_in_temp)
+	{
+		const RenderTarget* tertiary = render_layers.PeekPostprocessTertiary();
+		if (tertiary && tertiary != &temp && tertiary != &source_destination)
+			vertical_destination = tertiary;
+		else
+		{
+			// No third target to borrow: move the image across and go on as before.
+			DrawTextureToTarget(temp, source_destination.color, Blending::Replace);
+			vertical_source = &temp;
+		}
+	}
 
 	BlurUniforms uniforms = {};
 	SetBlurWeights(uniforms.weights, blur_num_weights, sigma);
@@ -2234,8 +2260,8 @@ void RenderInterface_SDL_GPU::RenderBlur(float sigma, const RenderTarget& source
 
 	// Blur render pass - vertical.
 	vertex_uniforms.texel_offset = Vector2f(0.f, 1.f) / float(temp.height);
-	state.texture = temp.color;
-	DrawPostprocessQuad(source_destination, state);
+	state.texture = vertical_source->color;
+	DrawPostprocessQuad(*vertical_destination, state);
 
 	// Add a 1px transparent border around the blur region by first clearing with a padded scissor. This helps prevent
 	// artifacts when upscaling the blur result in the later step: sampling along the edge of the region otherwise
@@ -2246,7 +2272,7 @@ void RenderInterface_SDL_GPU::RenderBlur(float sigma, const RenderTarget& source
 
 	// Blur render pass - horizontal.
 	vertex_uniforms.texel_offset = Vector2f(1.f, 0.f) / float(source_destination.width);
-	state.texture = source_destination.color;
+	state.texture = vertical_destination->color;
 	DrawPostprocessQuad(temp, state);
 
 	// Scale the blurred image back over the region it came from -- unless the halving left nothing to scale. A window
