@@ -300,11 +300,20 @@ LayerHandle RenderManager::PushLayer()
 	return layer;
 }
 
-void RenderManager::CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters)
+void RenderManager::CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters,
+	Rectanglei input_region)
 {
 	RMLUI_ASSERT(source == 0 || std::find(render_stack.begin(), render_stack.end(), source) != render_stack.end());
 	RMLUI_ASSERT(destination == 0 || std::find(render_stack.begin(), render_stack.end(), destination) != render_stack.end());
-	render_interface->CompositeLayers(source, destination, blend_mode, filters);
+
+	// Clipped to the viewport exactly as a scissor region is, and for the same reason: the region is what the renderer
+	// reads through, and a filter reading a region larger than the target behaves differently from one reading the
+	// part that exists. The caller derives this from an element's ink overflow, which routinely reaches outside the
+	// window.
+	if (input_region.Valid())
+		input_region = input_region.Intersect(Rectanglei::FromSize(viewport_dimensions));
+
+	render_interface->CompositeLayers(source, destination, blend_mode, filters, input_region);
 }
 
 void RenderManager::PopLayer()

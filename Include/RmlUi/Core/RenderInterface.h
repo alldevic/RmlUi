@@ -101,8 +101,16 @@ public:
 	/// @param[in] destination The destination layer.
 	/// @param[in] blend_mode The mode used to blend the source layer onto the destination layer.
 	/// @param[in] filters A list of compiled filters which should be applied before blending.
+	/// @param[in] input_region The region compositing may read from, in window coordinates. An invalid rectangle
+	/// means it reads exactly what it writes, which is the active scissor region.
 	/// @note Source and destination can reference the same layer.
-	virtual void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters);
+	/// @note A valid `input_region` is always at least as large as the scissor region, and separates the two halves
+	/// of the operation: the source layer and everything the filters read from it are taken out of `input_region`,
+	/// while the scissor region and the clip mask apply only to what reaches the destination. That is what lets a
+	/// `backdrop-filter` blur pick up the backdrop from around the element and still paint only inside its own
+	/// border, without a temporary layer to clip through afterwards.
+	virtual void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters,
+		Rectanglei input_region);
 	/// Called by RmlUi when it wants to pop the render layer stack, setting the new top layer as the render target.
 	virtual void PopLayer();
 

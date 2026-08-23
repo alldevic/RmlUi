@@ -1894,9 +1894,22 @@ Rml::LayerHandle RenderInterface_GL3::PushLayer()
 }
 
 void RenderInterface_GL3::CompositeLayers(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle, Rml::BlendMode blend_mode,
-	Rml::Span<const Rml::CompiledFilterHandle> filters)
+	Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region)
 {
 	using Rml::BlendMode;
+
+	// Everything that reads the source -- the blit below and the filters after it -- is confined by the scissor, so
+	// widening it for the input half and putting it back for the output half is all a separate input region takes
+	// here. The postprocess framebuffers carry no stencil, so the clip mask reaches only the draw into the
+	// destination either way.
+	//
+	// What is left standing in the postprocess framebuffer outside the region is the previous composite, and a blur
+	// samples a little beyond what it writes, so the edge of a filtered backdrop depends on it. Neither clearing it
+	// first nor blitting the whole layer improves matters -- both move more of the suite than they settle -- so it is
+	// left exactly as it was.
+	const Rml::Rectanglei output_scissor = scissor_state;
+	if (input_region.Valid())
+		SetScissor(input_region);
 
 	// Blit source layer to postprocessing buffer. Do this regardless of whether we actually have any filters to be
 	// applied, because we need to resolve the multi-sampled framebuffer in any case.
@@ -1905,6 +1918,9 @@ void RenderInterface_GL3::CompositeLayers(Rml::LayerHandle source_handle, Rml::L
 
 	// Render the filters, the PostprocessPrimary framebuffer is used for both input and output.
 	RenderFilters(filters);
+
+	if (input_region.Valid())
+		SetScissor(output_scissor);
 
 	// Render to the destination layer.
 	glBindFramebuffer(GL_FRAMEBUFFER, render_layers.GetLayer(destination_handle).framebuffer);

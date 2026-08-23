@@ -1860,9 +1860,17 @@ Rml::LayerHandle RenderInterface_DX11::PushLayer()
 }
 
 void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::LayerHandle destination_handle, Rml::BlendMode blend_mode,
-	Rml::Span<const Rml::CompiledFilterHandle> filters)
+	Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region)
 {
 	using Rml::BlendMode;
+
+	// Everything that reads the source -- the blit below and the filters after it -- is confined by the scissor, so
+	// widening it for the input half and putting it back for the output half is all a separate input region takes
+	// here. The postprocess targets carry no stencil, so the clip mask reaches only the draw into the destination
+	// either way.
+	const Rml::Rectanglei output_scissor = m_scissor_state;
+	if (input_region.Valid())
+		SetScissor(input_region);
 
 	// Blit source layer to postprocessing buffer. Do this regardless of whether we actually have any filters to be
 	// applied, because we need to resolve the multi-sampled framebuffer in any case.
@@ -1871,6 +1879,9 @@ void RenderInterface_DX11::CompositeLayers(Rml::LayerHandle source_handle, Rml::
 
 	// Render the filters, the PostprocessPrimary framebuffer is used for both input and output.
 	RenderFilters(filters);
+
+	if (input_region.Valid())
+		SetScissor(output_scissor);
 
 	// Render to the destination layer.
 	Gfx::BindRenderTarget(m_d3d_context, m_render_layers.GetLayer(destination_handle));

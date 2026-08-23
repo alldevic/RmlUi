@@ -977,6 +977,7 @@ RenderInterface_SDL_GPU::RenderInterface_SDL_GPU(SDL_GPUDevice* device, SDL_Wind
 		if (!(chunk_interval > 0.0))
 			chunk_interval = 0.0;
 	}
+
 }
 
 RenderInterface_SDL_GPU::~RenderInterface_SDL_GPU()
@@ -1811,6 +1812,11 @@ Rectanglei RenderInterface_SDL_GPU::GetScissorRegion() const
 {
 	if (scissor_override_active)
 		return scissor_override;
+	// Compositing is reading its input, and RmlUi gave a wider region for it than for the output. Sits below the
+	// override above so that the blur and the wipe of a stale target still get their own regions, and falls back to
+	// this one rather than to the output region once they are done.
+	if (composite_input_active)
+		return composite_input_region;
 
 	const Rectanglei target = Rectanglei::FromSize({render_layers.GetWidth(), render_layers.GetHeight()});
 	if (!scissor_enabled)
@@ -2837,7 +2843,7 @@ void RenderInterface_SDL_GPU::PopLayer()
 }
 
 void RenderInterface_SDL_GPU::CompositeLayers(LayerHandle source, LayerHandle destination, Rml::BlendMode blend_mode,
-	Span<const CompiledFilterHandle> filters)
+	Span<const CompiledFilterHandle> filters, Rectanglei input_region)
 {
 	// Via the postprocess targets when the source cannot simply be sampled into the destination: the contract allows
 	// both handles to name the same layer, and a texture cannot be a colour attachment and a sampler binding at once.
@@ -2860,14 +2866,33 @@ void RenderInterface_SDL_GPU::CompositeLayers(LayerHandle source, LayerHandle de
 
 	if (via_postprocess)
 	{
+		// The hop into the postprocess target and the filters that follow it read the source, so they run under the
+		// input region where RmlUi gave one -- wide enough for a blur to reach outside the element. The draw that
+		// reaches the destination stays under the scissor and clip mask RmlUi asked for, which is what keeps the
+		// backdrop of a rounded element from being filtered outside its own border. Everything we read already went
+		// through the postprocess targets under a scissor of our own choosing, so the two halves were separable
+		// here to begin with; this only says which region the first half gets.
+		composite_input_active = input_region.Valid();
+		composite_input_region = input_region;
+		scissor_dirty = scissor_dirty || composite_input_active;
+
 		// The second hop below samples whatever this one leaves in the postprocess target. If it could not be issued
 		// -- no target to allocate, no buffer to build the quad from -- that target still holds the previous
 		// composite, and going on would blend a stale image into the destination. Better to leave the destination as
 		// it is: the frame is already degraded, and an error has been logged where the failure happened.
 		if (!BlitLayerToPostprocessPrimary(source_layer))
+		{
+			composite_input_active = false;
 			return;
+		}
 
 		RenderFilters(filters);
+
+		if (composite_input_active)
+		{
+			composite_input_active = false;
+			scissor_dirty = true;
+		}
 
 		// Taken only now: each filter swaps the primary and secondary targets, so a reference from before the chain
 		// ran would name the scratch target rather than the result.

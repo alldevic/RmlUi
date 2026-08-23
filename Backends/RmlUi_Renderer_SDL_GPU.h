@@ -66,7 +66,7 @@ public:
 
 	Rml::LayerHandle PushLayer() override;
 	void CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
-		Rml::Span<const Rml::CompiledFilterHandle> filters) override;
+		Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region) override;
 	void PopLayer() override;
 
 	Rml::TextureHandle SaveLayerAsTexture() override;
@@ -658,10 +658,12 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	SDL_Rect applied_scissor = {};
 	bool scissor_override_active = false;
 	Rml::Rectanglei scissor_override;
+	// The region compositing is reading from while it fills the postprocess target, where RmlUi has asked for one
+	// wider than the region it writes; see CompositeLayers(). Set only for the input half of a composite, which is
+	// what GetScissorRegion() looks at.
+	bool composite_input_active = false;
+	Rml::Rectanglei composite_input_region;
 
-	// Clearing the stencil buffer for every mask would mean breaking the render pass, which is all SDL GPU offers, so
-	// each mask claims a value never written since the last real clear. stencil_high_water bounds what the buffer
-	// holds, and the next mask picks above it.
 	bool clip_mask_enabled = false;
 	// Until a mask has been rendered, passes carry no stencil attachment: every pass loads and stores it, which on a
 	// multisampled layer is megabytes of traffic for a buffer nothing would read.

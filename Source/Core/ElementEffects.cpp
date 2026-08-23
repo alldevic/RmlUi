@@ -233,15 +233,15 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 		Rectanglei scissor_region = Rectanglei(filter_region).IntersectIfValid(render_manager->GetScissorRegion());
 		render_manager->SetScissorRegion(scissor_region);
 	};
-	auto ApplyScissorRegionForBackdrop = [this, &render_manager]() {
-		// Set the scissor region for backdrop drawing, which covers the element's border box plus any area we may need
-		// to read from, such as any blur radius.
+	auto GetBackdropInputRegion = [this]() {
+		// The region the backdrop filters read from: the element's border box plus any area they may need to reach
+		// outside it, such as any blur radius.
 		Rectanglef filter_region = Rectanglef::MakeInvalid();
 		ElementUtilities::GetBoundingBox(filter_region, element, BoxArea::Border);
 		for (const auto& filter : backdrop_filters)
 			filter.filter->ExtendInkOverflow(element, filter_region);
 		Math::ExpandToPixelGrid(filter_region);
-		render_manager->SetScissorRegion(Rectanglei(filter_region));
+		return Rectanglei(filter_region);
 	};
 
 	if (render_stage == RenderStage::Enter)
@@ -276,26 +276,18 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 		{
 			const LayerHandle backdrop_destination_layer = render_manager->GetTopLayer();
 
-			// @performance We strictly only need this temporary buffer when having to read from outside the element
-			// boundaries, which currently only applies to blur and drop-shadow. Alternatively, we could avoid this
-			// completely if we introduced a render interface API concept of different input and output clipping. That
-			// is, we set a large input scissor to cover all input data, which can be used e.g. during blurring, and use
-			// our small border-area-only clipping region for the composite layers output.
-			ApplyScissorRegionForBackdrop();
-			render_manager->PushLayer();
-			const LayerHandle backdrop_temp_layer = render_manager->GetTopLayer();
-
 			FilterHandleList filter_handles;
 			for (auto& filter : backdrop_filters)
 				filter.compiled.AddHandleTo(filter_handles);
 
-			// Render the backdrop filters in the extended scissor region including any ink overflow.
-			render_manager->CompositeLayers(backdrop_source_layer, backdrop_temp_layer, BlendMode::Blend, filter_handles);
-
-			// Then composite the filter output to our destination while applying our clipping region, including any border-radius.
+			// The backdrop is read from a region extended by any ink overflow -- blur and drop-shadow reach outside
+			// the element -- but written under our own clipping region, including any border-radius. Handing the
+			// render interface both regions at once is what lets this be a single composite: the alternative is to
+			// park the filtered backdrop in a temporary layer and clip it on the way back out, which costs a layer,
+			// a second composite and a resolve on every element with a backdrop filter.
 			ApplyClippingRegion(PropertyId::BackdropFilter);
-			render_manager->CompositeLayers(backdrop_temp_layer, backdrop_destination_layer, BlendMode::Blend, {});
-			render_manager->PopLayer();
+			render_manager->CompositeLayers(backdrop_source_layer, backdrop_destination_layer, BlendMode::Blend, filter_handles,
+				GetBackdropInputRegion());
 			render_manager->SetScissorRegion(initial_scissor_region);
 		}
 	}

@@ -76,7 +76,10 @@ public:
 	CompiledShader CompileShader(const String& name, const Dictionary& parameters);
 
 	LayerHandle PushLayer();
-	void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters);
+	// The input region is what compositing may read from; pass an invalid rectangle to read the scissor region, which
+	// is what it writes. See RenderInterface::CompositeLayers.
+	void CompositeLayers(LayerHandle source, LayerHandle destination, BlendMode blend_mode, Span<const CompiledFilterHandle> filters,
+		Rectanglei input_region = Rectanglei::MakeInvalid());
 	void PopLayer();
 
 	LayerHandle GetTopLayer() const;

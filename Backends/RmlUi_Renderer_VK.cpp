@@ -3873,13 +3873,25 @@ void RenderInterface_VK::PopLayer()
 }
 
 void RenderInterface_VK::CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
-	Rml::Span<const Rml::CompiledFilterHandle> filters)
+	Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region)
 {
 	RMLUI_ZoneScopedN("Vulkan - CompositeLayers");
+
+	// A separate input region only takes widening the scissor over the half that reads the source and putting it back
+	// for the half that writes the destination. The blit below copies the whole layer, so it needs no region of its
+	// own; what does read m_scissor is RenderFilters -- blur windows and texture coordinate limits -- and that is
+	// exactly what has to see beyond the element for a backdrop filter. The postprocess targets carry no stencil, so
+	// the clip mask reaches only the draw into the destination either way.
+	const Rml::Rectanglei output_scissor = m_scissor;
+	if (input_region.Valid())
+		SetScissor(input_region);
 
 	BlitLayerToPostprocessPrimary(source);
 
 	RenderFilters(filters);
+
+	if (input_region.Valid())
+		SetScissor(output_scissor);
 
 	// Note: no Flush() here (mirrors the DX12 renderer, which removed it). Draining the GPU pipeline on every layer
 	// composite is a severe stall, and with fence-stamped deferred deletion of geometry/textures/descriptors it is no

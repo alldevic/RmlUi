@@ -29,7 +29,7 @@ LayerHandle RenderInterface::PushLayer()
 }
 
 void RenderInterface::CompositeLayers(LayerHandle /*source*/, LayerHandle /*destination*/, BlendMode /*blend_mode*/,
-	Span<const CompiledFilterHandle> /*filters*/)
+	Span<const CompiledFilterHandle> /*filters*/, Rectanglei /*input_region*/)
 {}
 
 void RenderInterface::PopLayer() {}

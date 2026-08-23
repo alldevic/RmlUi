@@ -469,7 +469,7 @@ public:
 
 	Rml::LayerHandle PushLayer() override;
 	void CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
-		Rml::Span<const Rml::CompiledFilterHandle> filters) override;
+		Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region) override;
 	void PopLayer() override;
 
 	Rml::TextureHandle SaveLayerAsTexture() override;

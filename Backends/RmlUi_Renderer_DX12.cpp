@@ -3581,15 +3581,26 @@ void RenderInterface_DX12::RenderFilters(Rml::Span<const Rml::CompiledFilterHand
 }
 
 void RenderInterface_DX12::CompositeLayers(Rml::LayerHandle source, Rml::LayerHandle destination, Rml::BlendMode blend_mode,
-	Rml::Span<const Rml::CompiledFilterHandle> filters)
+	Rml::Span<const Rml::CompiledFilterHandle> filters, Rml::Rectanglei input_region)
 {
 	RMLUI_ZoneScopedN("DirectX 12 - CompositeLayers");
 
 	RMLUI_DX_MARKER_BEGIN(m_p_command_graphics_list, "CompositeLayers");
 
+	// Everything that reads the source -- the blit below and the filters after it -- is confined by the scissor, so
+	// widening it for the input half and putting it back for the output half is all a separate input region takes
+	// here. The postprocess targets carry no stencil, so the clip mask reaches only the draw into the destination
+	// either way.
+	const Rml::Rectanglei output_scissor = m_scissor;
+	if (input_region.Valid())
+		SetScissor(input_region);
+
 	BlitLayerToPostprocessPrimary(source);
 
 	RenderFilters(filters);
+
+	if (input_region.Valid())
+		SetScissor(output_scissor);
 
 	// Note: no Flush() here. Draining the GPU pipeline on every layer composite is a severe stall, and with
 	// fence-stamped deferred deletion of geometry/textures it is no longer needed as a workaround to hide
