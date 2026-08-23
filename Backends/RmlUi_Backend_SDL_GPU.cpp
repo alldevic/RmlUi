@@ -213,21 +213,17 @@ void Backend::BeginFrame()
 		return;
 	}
 
-	SDL_GPUTexture* swapchain_texture;
-	uint32_t width;
-	uint32_t height;
-	if (!SDL_WaitAndAcquireGPUSwapchainTexture(data->command_buffer, data->window, &swapchain_texture, &width, &height))
+	// The swapchain texture is taken by the renderer at the end of the frame, not here: it belongs to whichever
+	// command buffer takes it, and the renderer may send the frame in several of them. So the frame is laid out for
+	// the window's size, and whether there is anything to present at all is answered here instead -- a minimized
+	// window has nothing to draw into and would otherwise be rendered every frame for nothing.
+	int width = 0;
+	int height = 0;
+	SDL_GetWindowSizeInPixels(data->window, &width, &height);
+	if (width <= 0 || height <= 0 || (SDL_GetWindowFlags(data->window) & SDL_WINDOW_MINIMIZED))
 	{
-		Rml::Log::Message(Rml::Log::LT_ERROR, "Failed to acquire swapchain texture: %s", SDL_GetError());
-		SDL_CancelGPUCommandBuffer(data->command_buffer);
-		data->command_buffer = nullptr;
-		return;
-	}
-
-	if (!swapchain_texture || !width || !height)
-	{
-		// Not an error. Happens on minimize. The buffer is cleared along with being cancelled, so that PresentFrame()
-		// does not go on to submit one that no longer exists.
+		// Not an error. The buffer is cleared along with being cancelled, so that PresentFrame() does not go on to
+		// submit one that no longer exists.
 		SDL_CancelGPUCommandBuffer(data->command_buffer);
 		data->command_buffer = nullptr;
 		return;
@@ -235,16 +231,16 @@ void Backend::BeginFrame()
 
 	// No need to clear the swapchain texture: the renderer draws to its own layers and overwrites the whole swapchain
 	// with the result in EndFrame().
-	data->render_interface.BeginFrame(data->command_buffer, swapchain_texture, width, height);
+	data->render_interface.BeginFrame(data->command_buffer, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
 }
 
 void Backend::PresentFrame()
 {
 	RMLUI_ASSERT(data);
-	data->render_interface.EndFrame();
 
-	// Absent when the frame was skipped, in which case the buffer has already been cancelled.
-	if (data->command_buffer)
-		SDL_SubmitGPUCommandBuffer(data->command_buffer);
+	// Not necessarily the buffer BeginFrame() acquired: a frame may be sent in several, and the ones before the last
+	// have already gone. Null when the frame was skipped, in which case the buffer has already been cancelled.
+	if (SDL_GPUCommandBuffer* command_buffer = data->render_interface.EndFrame())
+		SDL_SubmitGPUCommandBuffer(command_buffer);
 	data->command_buffer = nullptr;
 }

@@ -29,8 +29,19 @@ public:
 
 	void Shutdown();
 
-	void BeginFrame(SDL_GPUCommandBuffer* command_buffer, SDL_GPUTexture* swapchain_texture, uint32_t width, uint32_t height);
-	void EndFrame();
+	// Prepares the renderer to take rendering commands from RmlUi. Rendering goes to the renderer's own layers; the
+	// result is copied to the swapchain texture by EndFrame(). The size is the one the frame is laid out for, which
+	// is the window's size in pixels.
+	void BeginFrame(SDL_GPUCommandBuffer* command_buffer, uint32_t width, uint32_t height);
+	/*
+	    Takes the swapchain texture, copies the base layer into it and returns the command buffer to submit -- which
+	    is not necessarily the one BeginFrame() was given: a frame may be sent in several buffers, and the ones before
+	    the last have already gone. Null when there is nothing to submit.
+
+	    The swapchain texture is taken here rather than before recording because it belongs to whichever buffer takes
+	    it, and that buffer is presented when it is submitted -- so it has to be the last one of the frame.
+	*/
+	SDL_GPUCommandBuffer* EndFrame();
 
 	// Rows come back bottom-up. Must be called after EndFrame() and before the next BeginFrame().
 	bool CaptureScreen(int& width, int& height, int& num_components, Rml::UniquePtr<Rml::byte[]>& data);
@@ -456,6 +467,18 @@ private:
 	bool EnsureUploadPass();
 	void SubmitUploads();
 
+	/*
+	    Sends what the frame has recorded so far and goes on recording into a fresh command buffer, so that the GPU
+	    can start on the beginning of a frame while the end of it is still being written. A frame recorded into a
+	    single buffer reaches the GPU only once the last draw has been recorded, and on a document that takes a long
+	    time to record that is milliseconds of device idling behind the CPU -- the reference backend has no such gap,
+	    because the OpenGL driver flushes batches of its own accord as the frame is recorded.
+	*/
+	void SubmitChunk();
+	// Takes the cut if enough recording time has gone by since the last one. Called where a cut is known to be safe:
+	// between two draws submitted by RmlUi, with nothing of the renderer's own half-done.
+	void MaybeSubmitChunk();
+
 	bool FlushGeometryUploads();
 
 	struct DrawState {
@@ -539,6 +562,9 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	SDL_GPUSampler* linear_sampler = nullptr;
 	SDL_GPUSampler* clamp_sampler = nullptr;
 
+	// Frame state, valid between BeginFrame() and EndFrame().
+	// The buffer being recorded into. Not necessarily the one BeginFrame() was given: a frame may be cut into
+	// several, and this then names the last of them. See SubmitChunk().
 	SDL_GPUCommandBuffer* command_buffer = nullptr;
 	SDL_GPUTexture* swapchain_texture = nullptr;
 	uint32_t swapchain_width = 0;
@@ -551,6 +577,49 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	// there to reach the swapchain, and then it also drops the layer's samples -- so this is both what lets
 	// CaptureScreen() read the frame without resolving again and what tells it that resolving again is not an option.
 	bool frame_resolved_into_postprocess = false;
+
+	/*
+	    How much recording time to let pass before cutting the frame into another command buffer, in seconds, or zero
+	    to record it whole. Overridable through RMLUI_SDL_GPU_CHUNK_MS at construction; see SubmitChunk().
+
+	    One millisecond, because that is about what a submission costs on a loaded device, so a cut has to have at
+	    least that much recording behind it before it can have bought anything. Measured: on `filters` the interval
+	    is flat from half a millisecond to one and a half and falls away by four.
+
+	    Recording time rather than a number of draws, because that is what decides whether a cut pays. A cut buys the
+	    GPU whatever it can do while the rest of the frame is being recorded, and costs one command buffer
+	    submission, which on a loaded device is around a millisecond of CPU -- see .docs/experiments.md. So a cut is
+	    worth taking only where there is at least that much recording left to hide work behind, and a draw count says
+	    nothing about that: `filters` records at eight microseconds a draw and `boxes` at less than one.
+	*/
+	double chunk_interval = 0.001;
+	// When the frame and the current chunk started recording, on the performance counter, and how often to look at
+	// the clock. A read is cheap but not free, and a frame of `boxes` issues 1726 draws.
+	Uint64 frame_start_ticks = 0;
+	Uint64 chunk_start_ticks = 0;
+	static constexpr int chunk_check_draw_mask = 63;
+	/*
+	    How much recording a cut has to have ahead of it to be worth taking, as a multiple of chunk_interval. This is
+	    the half of the decision that is easy to miss: a cut costs a submission whether or not anything comes of it,
+	    so one taken near the end of a frame pays the cost and buys almost no overlap. Three rather than one, because
+	    what is ahead is an estimate and the cost is not: at one, `radius` -- whose whole frame records in under three
+	    milliseconds -- took a cut that bought nothing and cost it 13% of its frame.
+	*/
+	static constexpr int chunk_min_remaining_intervals = 3;
+	/*
+	    How long the last frame took to record, in seconds, and how much of the current one has gone into sending
+	    chunks. Frames of a document resemble one another closely enough for the last one to say how much recording
+	    this one has left.
+
+	    The submission time is subtracted because sending is not recording, and counting it would let cutting feed on
+	    itself: a frame that cut takes longer to record, which on its own would license the next frame to cut again.
+	    The correction is not exact -- some of what a submission costs surfaces in the recording that follows it
+	    rather than in the call itself -- which is the other reason the margin above is as wide as it is.
+	*/
+	double last_frame_record = 0.0;
+	double frame_submit_time = 0.0;
+	// What frame_num_draws stood at when the current chunk began; a chunk with nothing in it is not worth sending.
+	int chunk_start_draw = 0;
 
 	// Everything RmlUi asked for and has not given back. RmlUi releases each of them during Rml::Shutdown(), which
 	// clients call before shutting the backend down, so all four are zero by the time Shutdown() runs. A leak in a

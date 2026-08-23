@@ -966,6 +966,17 @@ RenderInterface_SDL_GPU::RenderInterface_SDL_GPU(SDL_GPUDevice* device, SDL_Wind
 
 	if (!linear_sampler || !clamp_sampler)
 		Log::Message(Log::LT_ERROR, "Failed to create sampler: %s", SDL_GetError());
+
+	// How much recording time to let pass before sending the frame so far to the GPU; see SubmitChunk(). The
+	// environment may override it, with zero to record every frame whole -- which is there so that the two paths can
+	// be measured against each other by alternating runs, the only way a few percent is visible on hardware that
+	// drifts by fifteen over a session.
+	if (const char* chunk_ms = SDL_getenv("RMLUI_SDL_GPU_CHUNK_MS"))
+	{
+		chunk_interval = SDL_atof(chunk_ms) / 1000.0;
+		if (!(chunk_interval > 0.0))
+			chunk_interval = 0.0;
+	}
 }
 
 RenderInterface_SDL_GPU::~RenderInterface_SDL_GPU()
@@ -1015,11 +1026,10 @@ void RenderInterface_SDL_GPU::Shutdown()
 
 // -- Frame and pass management -----------------------------------------------
 
-void RenderInterface_SDL_GPU::BeginFrame(SDL_GPUCommandBuffer* in_command_buffer, SDL_GPUTexture* in_swapchain_texture, uint32_t width,
-	uint32_t height)
+void RenderInterface_SDL_GPU::BeginFrame(SDL_GPUCommandBuffer* in_command_buffer, uint32_t width, uint32_t height)
 {
 	command_buffer = in_command_buffer;
-	swapchain_texture = in_swapchain_texture;
+	swapchain_texture = nullptr;
 	swapchain_width = width;
 	swapchain_height = height;
 	frame_index += 1;
@@ -1038,6 +1048,10 @@ void RenderInterface_SDL_GPU::BeginFrame(SDL_GPUCommandBuffer* in_command_buffer
 	frame_num_draws = 0;
 	frame_num_passes = 0;
 	frame_num_resolves = 0;
+	chunk_start_draw = 0;
+	frame_start_ticks = SDL_GetPerformanceCounter();
+	chunk_start_ticks = frame_start_ticks;
+	frame_submit_time = 0.0;
 
 	// RmlUi resets its render state between frames, so no mask carries over. Nothing in the stencil buffer is worth
 	// keeping either: the first mask of the frame clears it, and until then no pass even carries it.
@@ -1070,7 +1084,7 @@ void RenderInterface_SDL_GPU::BeginFrame(SDL_GPUCommandBuffer* in_command_buffer
 	EnsureRenderPass(render_layers.GetTopLayer(), true);
 }
 
-void RenderInterface_SDL_GPU::EndFrame()
+SDL_GPUCommandBuffer* RenderInterface_SDL_GPU::EndFrame()
 {
 	// The backend skips BeginFrame() for a frame it cannot present, most often because the window is minimized, but
 	// still calls this. The layer stack must not be popped then: it was never pushed, and taking it below the base
@@ -1087,11 +1101,27 @@ void RenderInterface_SDL_GPU::EndFrame()
 		frame_index += 1;
 		vertex_arena.BeginFrame(frame_index);
 		index_arena.BeginFrame(frame_index);
-		return;
+		return nullptr;
 	}
 	frame_active = false;
 
+	// Recording ends here; what follows is the copy to the swapchain. This is what the next frame measures itself
+	// against to decide how far into itself cutting still pays; see MaybeSubmitChunk().
+	last_frame_record = double(SDL_GetPerformanceCounter() - frame_start_ticks) / double(SDL_GetPerformanceFrequency()) - frame_submit_time;
+
 	EndRenderPass();
+
+	// The last command buffer of the frame is the one that presents, so this is where the swapchain texture is
+	// taken. A texture that came back null is not an error: it happens when the window is minimized, and the frame
+	// is then simply not copied anywhere.
+	if (command_buffer && window)
+	{
+		if (!SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, window, &swapchain_texture, &swapchain_width, &swapchain_height))
+		{
+			Log::Message(Log::LT_ERROR, "Failed to acquire swapchain texture: %s", SDL_GetError());
+			swapchain_texture = nullptr;
+		}
+	}
 
 	// Where the swapchain agrees with the layers in format and size, the frame resolves straight into it; otherwise
 	// the resolve goes to a postprocess target and a blit converts from there. Only the first route leaves the
@@ -1154,8 +1184,10 @@ void RenderInterface_SDL_GPU::EndFrame()
 	// transfers this frame depends on can still be placed ahead of it.
 	SubmitUploads();
 
+	SDL_GPUCommandBuffer* const buffer_to_submit = command_buffer;
 	command_buffer = nullptr;
 	swapchain_texture = nullptr;
+	return buffer_to_submit;
 }
 
 void RenderInterface_SDL_GPU::InvalidateRenderPassState()
@@ -1287,6 +1319,92 @@ void RenderInterface_SDL_GPU::SubmitUploads()
 	}
 
 	pending_upload_bytes = 0;
+}
+
+/*
+    Ends the frame's current command buffer, sends it, and takes a fresh one to go on recording into.
+
+    What this buys is overlap. A frame recorded into one buffer reaches the device only after its last draw has been
+    written, so the GPU sits idle for the whole of the recording and the CPU sits idle for the whole of the drawing;
+    on `filters` at 1600x900 that is 11 ms of recording during which the device does nothing. The reference OpenGL
+    backend has no such gap -- the driver flushes batches of its own as the frame is recorded -- and this is how that
+    is matched here.
+
+    What it costs is one submission, and that is the whole difficulty: SDL_SubmitGPUCommandBuffer takes around a
+    millisecond of CPU whenever the device still has work outstanding -- measured, and measured on an empty command
+    buffer, so it is nothing to do with what was recorded. Breaking the pass costs a microsecond and taking the next
+    buffer six, which beside that is nothing. So a cut is only ever worth taking where there is at least a
+    millisecond of recording on either side of it; see MaybeSubmitChunk(), and .docs/experiments.md for the numbers.
+*/
+void RenderInterface_SDL_GPU::SubmitChunk()
+{
+	if (!command_buffer)
+		return;
+
+	const Uint64 submit_start = SDL_GetPerformanceCounter();
+
+	// The contents survive: every pass stores what it wrote, and the one the next draw opens loads it back.
+	EndRenderPass();
+
+	// The draws about to be sent read from the buffers the upload command buffer fills. It is a separate buffer, and
+	// submitting it here is what keeps its copies ahead of them.
+	SubmitUploads();
+
+#if RMLUI_BACKEND_SDL_GPU_DEBUG
+	SDL_PopGPUDebugGroup(command_buffer);
+#endif
+	SDL_SubmitGPUCommandBuffer(command_buffer);
+
+	command_buffer = SDL_AcquireGPUCommandBuffer(device);
+	if (!command_buffer)
+	{
+		// Every draw for the rest of the frame is dropped, and EndFrame() still presents whatever the layers hold.
+		Log::Message(Log::LT_ERROR, "Failed to acquire command buffer: %s", SDL_GetError());
+	}
+#if RMLUI_BACKEND_SDL_GPU_DEBUG
+	else
+	{
+		SDL_PushGPUDebugGroup(command_buffer, "RmlUi frame");
+	}
+#endif
+
+	// Uniform pushes belong to the command buffer, and bindings and scissor to the pass; the new buffer carries
+	// neither, so nothing the cache remembers is true of it.
+	InvalidateRenderPassState();
+	chunk_start_draw = frame_num_draws;
+	// From here, not from where the submission began: what it just spent is not recording and is not counted as it.
+	const Uint64 submit_end = SDL_GetPerformanceCounter();
+	frame_submit_time += double(submit_end - submit_start) / double(SDL_GetPerformanceFrequency());
+	chunk_start_ticks = submit_end;
+}
+
+/*
+    Whether to cut the frame here. A cut is worth taking only where the device gets enough to do *and* the CPU goes
+    on recording long enough afterwards for the two to overlap -- so both how much has been recorded since the last
+    cut and how much is still to come have to cover what a cut costs. On the benchmark scenes only `filters` records
+    a frame slowly enough for both to hold; `boxes` records its whole frame in about the time one submission takes,
+    and cutting it is a straight loss.
+*/
+void RenderInterface_SDL_GPU::MaybeSubmitChunk()
+{
+	if (chunk_interval <= 0.0 || frame_num_draws == chunk_start_draw)
+		return;
+	// The clock is only looked at every so many draws; between those the frame goes on as it would anyway.
+	if ((frame_num_draws & chunk_check_draw_mask) != 0)
+		return;
+
+	const double frequency = double(SDL_GetPerformanceFrequency());
+	const Uint64 now = SDL_GetPerformanceCounter();
+	if (double(now - chunk_start_ticks) / frequency < chunk_interval)
+		return;
+
+	// How far into recording this frame is, against how far the last one went. The margin has to fit between the
+	// two, or there is not enough left for the device to work behind.
+	const double recorded = double(now - frame_start_ticks) / frequency - frame_submit_time;
+	if (recorded + chunk_min_remaining_intervals * chunk_interval > last_frame_record)
+		return;
+
+	SubmitChunk();
 }
 
 bool RenderInterface_SDL_GPU::FlushGeometryUploads()
@@ -1505,6 +1623,10 @@ void RenderInterface_SDL_GPU::RenderGeometry(CompiledGeometryHandle handle, Vect
 	state.texture = reinterpret_cast<SDL_GPUTexture*>(texture);
 	state.translation = translation;
 	DrawGeometry(*geometry, state);
+
+	// Between two draws submitted by RmlUi is where the frame may be cut: nothing of the renderer's own is half-done
+	// here, unlike inside a filter chain or a layer composite.
+	MaybeSubmitChunk();
 }
 
 // -- Textures ----------------------------------------------------------------
@@ -1997,6 +2119,8 @@ void RenderInterface_SDL_GPU::RenderShader(CompiledShaderHandle shader_handle, C
 	}
 	break;
 	}
+
+	MaybeSubmitChunk();
 }
 
 void RenderInterface_SDL_GPU::ReleaseShader(CompiledShaderHandle shader_handle)
