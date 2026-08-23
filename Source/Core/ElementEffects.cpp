@@ -250,7 +250,26 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 
 		if (!filters.empty() || !mask_images.empty())
 		{
+			// Narrow the scissor to the region the filters will actually use before pushing. A pushed layer only has
+			// to be transparent within the active scissor, and the render interface is free to clear just that much --
+			// but with the scissor still covering the whole window, as it does here by default, every filtered element
+			// costs a full-window clear. The region is the same one applied on the way out, before compositing, so
+			// nothing outside it is ever read back. The scissor is put back straight away: the element and its
+			// children render under their own clipping, as before.
+			Rectanglef push_region = Rectanglef::MakeInvalid();
+			ElementUtilities::GetBoundingBox(push_region, element, BoxArea::Auto);
+			for (const auto& filter : filters)
+				filter.filter->ExtendInkOverflow(element, push_region);
+			Math::ExpandToPixelGrid(push_region);
+
+			const Rectanglei push_scissor = Rectanglei(push_region).IntersectIfValid(initial_scissor_region);
+			if (push_scissor.Valid())
+				render_manager->SetScissorRegion(push_scissor);
+
 			render_manager->PushLayer();
+
+			if (push_scissor.Valid())
+				render_manager->SetScissorRegion(initial_scissor_region);
 		}
 
 		if (!backdrop_filters.empty())
