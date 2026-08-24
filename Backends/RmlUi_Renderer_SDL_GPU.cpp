@@ -344,15 +344,35 @@ bool RenderInterface_SDL_GPU::GeometryArena::Flush(SDL_GPUCopyPass* copy_pass)
 	if (!EnsureTransferBuffer(byte_size))
 		return false;
 
-	// Cycled, since the transfer buffer of the previous flush may still be feeding copies the GPU has not run yet.
-	void* mapped = SDL_MapGPUTransferBuffer(device, transfers.buffer, true);
+	/*
+	    Each flush is written after the last rather than from the start, and the buffer is cycled only once it has
+	    no room left -- the same arrangement the texture uploads use, and for a sharper reason than it looks.
+
+	    A flush happens per draw, because RmlUi compiles a mesh just before the draw that needs it, so a document
+	    of two thousand meshes flushes two thousand times before its first frame is over. Cycling asks SDL for
+	    fresh storage whenever the buffer is still spoken for, which over that stretch it always is, and SDL keeps
+	    every one of those allocations for reuse. What that costs is not the memory: the kernel is handed the
+	    whole set of live allocations on every submission, at about half a microsecond each, so four thousand of
+	    them turn each submission into two milliseconds of nothing. Measured on a document of 1728 meshes: 3489
+	    objects and 1.5 ms per submission, against 39 objects and 49 us once the flushes append.
+
+	    Writing past what the copies already recorded read is what makes going without the cycle safe, and a copy
+	    recorded before a cycle goes on reading the storage it was recorded against.
+	*/
+	if (transfers.used + byte_size > transfers.capacity)
+		transfers.used = 0;
+	const Uint32 transfer_offset = transfers.used;
+
+	void* mapped = SDL_MapGPUTransferBuffer(device, transfers.buffer, transfer_offset == 0);
 	if (!mapped)
 	{
 		Log::Message(Log::LT_ERROR, "Failed to map transfer buffer: %s", SDL_GetError());
 		return false;
 	}
-	std::memcpy(mapped, staging.data(), byte_size);
+	std::memcpy(static_cast<byte*>(mapped) + transfer_offset, staging.data(), byte_size);
 	SDL_UnmapGPUTransferBuffer(device, transfers.buffer);
+	// Only now that the copies below read them are the bytes spoken for; a bail-out above leaves the slice free.
+	transfers.used = transfer_offset + byte_size;
 
 	for (size_t i = 0; i < pending_uploads.size();)
 	{
@@ -369,7 +389,7 @@ bool RenderInterface_SDL_GPU::GeometryArena::Flush(SDL_GPUCopyPass* copy_pass)
 
 		SDL_GPUTransferBufferLocation location{};
 		location.transfer_buffer = transfers.buffer;
-		location.offset = static_cast<Uint32>(first.staging_offset);
+		location.offset = transfer_offset + static_cast<Uint32>(first.staging_offset);
 
 		SDL_GPUBufferRegion region{};
 		region.buffer = first.block->buffer;
