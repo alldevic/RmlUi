@@ -434,9 +434,42 @@ static SDL_GPUSampleCount SelectSampleCount(SDL_GPUDevice* device, SDL_GPUTextur
 	return SDL_GPU_SAMPLECOUNT_1;
 }
 
-void RenderInterface_SDL_GPU::RenderLayerStack::Initialize(SDL_GPUDevice* in_device)
+/*
+    The format the layers are made of. The window's own is taken wherever the device can draw into it, so that a
+    multisampled frame resolves straight into the swapchain texture instead of into a target of its own. Where the
+    two disagree that resolve cannot happen, and the frame ends in a second full-screen pass whose only work is to
+    reorder channels: two such passes a frame rather than one, which measured at 0.23 ms at 1600x900 -- paid by every
+    scene whatever it draws.
+
+    Only the two plain 8-bit orderings are taken. An sRGB swapchain would move blending into another space and change
+    the picture; a wider or packed one would change what a downloaded frame holds. For those the fixed format stays,
+    and with it the pass that converts.
+*/
+SDL_GPUTextureFormat RenderInterface_SDL_GPU::SelectLayerFormat(SDL_GPUDevice* device, SDL_Window* window)
+{
+	if (!device || !window)
+		return default_layer_format;
+
+	const SDL_GPUTextureFormat swapchain_format = SDL_GetGPUSwapchainTextureFormat(device, window);
+	if (swapchain_format != SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM && swapchain_format != SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM)
+		return default_layer_format;
+
+	// Everything a layer or a postprocess target is ever used for, asked of the format before it is settled on: a
+	// device that renders into one format but cannot sample it back would leave the renderer unable to composite.
+	SDL_GPUTextureUsageFlags usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+#if RMLUI_SDL_GPU_SHADER_RESOLVE
+	usage |= SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ;
+#endif
+	if (!SDL_GPUTextureSupportsFormat(device, swapchain_format, SDL_GPU_TEXTURETYPE_2D, usage))
+		return default_layer_format;
+
+	return swapchain_format;
+}
+
+void RenderInterface_SDL_GPU::RenderLayerStack::Initialize(SDL_GPUDevice* in_device, SDL_GPUTextureFormat in_layer_format)
 {
 	device = in_device;
+	layer_format = in_layer_format;
 	supported_depth_stencil_format = SelectDepthStencilFormat(device);
 	depth_stencil_format = supported_depth_stencil_format;
 	if (depth_stencil_format == SDL_GPU_TEXTUREFORMAT_INVALID)
@@ -941,9 +974,12 @@ void RenderInterface_SDL_GPU::ReleasePipelines()
 	stencil_pipelines_failed = false;
 }
 
+// The window is only ever asked for the format of its swapchain, and only here: the layers are made of that format
+// so that the frame can be handed over without conversion, and nothing else depends on what the window looks like.
 RenderInterface_SDL_GPU::RenderInterface_SDL_GPU(SDL_GPUDevice* device, SDL_Window* window) : device(device), window(window)
 {
-	render_layers.Initialize(device);
+	layer_format = SelectLayerFormat(device, window);
+	render_layers.Initialize(device, layer_format);
 
 	vertex_arena.Initialize(device, SDL_GPU_BUFFERUSAGE_VERTEX, sizeof(Vertex), "RmlUi vertices");
 	index_arena.Initialize(device, SDL_GPU_BUFFERUSAGE_INDEX, sizeof(int), "RmlUi indices");
@@ -2702,8 +2738,10 @@ bool RenderInterface_SDL_GPU::ResolveTarget(SDL_GPUCommandBuffer* in_command_buf
 	SDL_GPUColorTargetInfo color_info{};
 	color_info.texture = source.color;
 	color_info.load_op = SDL_GPU_LOADOP_LOAD;
-	// Writing the samples back as well as resolving them costs bandwidth, so it is asked for only where they still
-	// matter.
+	// Writing the samples back as well as resolving them is asked for only where the samples still matter. It is not
+	// what it looks like on paper: at 1600x900 and two samples this is 11.5 MB of extra writing a frame, and yet six
+	// pairs with the order alternated put it at nothing on all seven scenes, sign wandering. Multisample compression
+	// is presumably why -- the samples of a pixel mostly agree, and what is written is the compressed form.
 	color_info.store_op = keep_samples ? SDL_GPU_STOREOP_RESOLVE_AND_STORE : SDL_GPU_STOREOP_RESOLVE;
 	color_info.resolve_texture = destination.color;
 
@@ -3143,15 +3181,21 @@ bool RenderInterface_SDL_GPU::CaptureScreen(int& out_width, int& out_height, int
 	out_num_components = 3;
 	out_data = UniquePtr<byte[]>(new byte[static_cast<size_t>(width) * static_cast<size_t>(height) * 3]);
 
+	// The callers expect rows bottom-up, as glReadPixels provides them, while the texture is stored top-down. They
+	// also expect red first, which the layers only store first where the window does: taking the window's format is
+	// what saves a full-screen conversion every frame, and this is the one reader that has to undo it.
+	const bool bgra = (layer_format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM);
+	const int red = bgra ? 2 : 0;
+	const int blue = bgra ? 0 : 2;
 	for (int y = 0; y < height; y++)
 	{
 		const byte* source_row = mapped + static_cast<size_t>(height - 1 - y) * static_cast<size_t>(width) * 4;
 		byte* destination_row = out_data.get() + static_cast<size_t>(y) * static_cast<size_t>(width) * 3;
 		for (int x = 0; x < width; x++)
 		{
-			destination_row[x * 3 + 0] = source_row[x * 4 + 0];
+			destination_row[x * 3 + 0] = source_row[x * 4 + red];
 			destination_row[x * 3 + 1] = source_row[x * 4 + 1];
-			destination_row[x * 3 + 2] = source_row[x * 4 + 2];
+			destination_row[x * 3 + 2] = source_row[x * 4 + blue];
 		}
 	}
 

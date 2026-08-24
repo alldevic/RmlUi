@@ -88,7 +88,10 @@ private:
 	static constexpr int frames_before_reuse = 3;
 	static constexpr int geometry_retention_frames = 120;
 	static constexpr uint32_t max_pending_upload_bytes = 8 * 1024 * 1024;
-	static constexpr SDL_GPUTextureFormat layer_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+	// What the layers are made of where the window's own format cannot be used; see SelectLayerFormat().
+	static constexpr SDL_GPUTextureFormat default_layer_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+	// The format of the pixels RmlUi hands to GenerateTexture(). Deliberately separate from the layers, which follow
+	// the window: one describes what the application uploads, the other what the renderer draws into.
 	static constexpr SDL_GPUTextureFormat content_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 	// Filters read and write the first two in turn, a blurred drop shadow needs a third while its own blur runs, and
 	// the fourth holds the image saved by SaveLayerAsMaskImage().
@@ -306,7 +309,7 @@ private:
 
 	class RenderLayerStack {
 	public:
-		void Initialize(SDL_GPUDevice* device);
+		void Initialize(SDL_GPUDevice* device, SDL_GPUTextureFormat layer_format);
 		void ReleaseAll();
 
 		void BeginFrame(int width, int height);
@@ -356,6 +359,7 @@ private:
 		SDL_GPUDevice* device = nullptr;
 		int width = 0;
 		int height = 0;
+		SDL_GPUTextureFormat layer_format = default_layer_format;
 		SDL_GPUSampleCount sample_count = SDL_GPU_SAMPLECOUNT_1;
 
 		int layers_size = 0;
@@ -441,6 +445,10 @@ private:
 		PipelineKey key;
 		SDL_GPUGraphicsPipeline* pipeline = nullptr;
 	};
+
+	// Picks what the layers are made of, given what the window presents. Called once, before anything of that format
+	// exists, and never again: the pipelines carry the answer.
+	static SDL_GPUTextureFormat SelectLayerFormat(SDL_GPUDevice* device, SDL_Window* window);
 
 	// What a Blending and a StencilMode mean to SDL, kept apart from the pipeline they are built into: both are
 	// tables of the API's own constants, and read as such once they are on their own.
@@ -540,7 +548,13 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	void ClearScissorOverride();
 
 	SDL_GPUDevice* device = nullptr;
+	// Kept for the format of the swapchain: the layers are made to agree with it, so that the frame is handed over
+	// without the blit that would otherwise convert between the two.
 	SDL_Window* window = nullptr;
+	// What the layers are made of. Decided once, at construction, from what the window presents; see
+	// SelectLayerFormat(). Everything the renderer draws into is of this format, pipelines included, so it must not
+	// change while any of them are alive.
+	SDL_GPUTextureFormat layer_format = default_layer_format;
 
 	SDL_GPUShader* shaders[num_shaders] = {};
 	bool shader_failed[num_shaders] = {};
