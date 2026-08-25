@@ -211,37 +211,27 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 
 	Rectanglei initial_scissor_region = render_manager->GetScissorRegion();
 
-	auto ApplyClippingRegion = [this, &render_manager](PropertyId filter_id) {
+	// The region an element's effects reach: its box, extended by however far the given filters draw outside it, and
+	// snapped out to the pixel grid.
+	auto GetFilterRegion = [this](BoxArea box_area, const FilterEntryList& filter_list) {
+		Rectanglef region = Rectanglef::MakeInvalid();
+		ElementUtilities::GetBoundingBox(region, element, box_area);
+		for (const auto& filter : filter_list)
+			filter.filter->ExtendInkOverflow(element, region);
+		Math::ExpandToPixelGrid(region);
+		return Rectanglei(region);
+	};
+	auto ApplyClippingRegion = [&](PropertyId filter_id) {
 		RMLUI_ASSERT(filter_id == PropertyId::Filter || filter_id == PropertyId::BackdropFilter);
 
 		const bool force_clip_to_self_border_box = (filter_id == PropertyId::BackdropFilter);
 		ElementUtilities::SetClippingRegion(element, force_clip_to_self_border_box);
 
-		// Find the region being affected by the active filters and apply it as a scissor.
-		Rectanglef filter_region = Rectanglef::MakeInvalid();
-		ElementUtilities::GetBoundingBox(filter_region, element, force_clip_to_self_border_box ? BoxArea::Border : BoxArea::Auto);
-
-		// The filter property may draw outside our normal clipping region due to ink overflow.
-		if (filter_id == PropertyId::Filter)
-		{
-			for (const auto& filter : filters)
-				filter.filter->ExtendInkOverflow(element, filter_region);
-		}
-
-		Math::ExpandToPixelGrid(filter_region);
-
-		Rectanglei scissor_region = Rectanglei(filter_region).IntersectIfValid(render_manager->GetScissorRegion());
-		render_manager->SetScissorRegion(scissor_region);
-	};
-	auto GetBackdropInputRegion = [this]() {
-		// The region the backdrop filters read from: the element's border box plus any area they may need to reach
-		// outside it, such as any blur radius.
-		Rectanglef filter_region = Rectanglef::MakeInvalid();
-		ElementUtilities::GetBoundingBox(filter_region, element, BoxArea::Border);
-		for (const auto& filter : backdrop_filters)
-			filter.filter->ExtendInkOverflow(element, filter_region);
-		Math::ExpandToPixelGrid(filter_region);
-		return Rectanglei(filter_region);
+		// A backdrop filter is clipped to the element's border box; the filter property may draw outside the normal
+		// clipping region due to ink overflow.
+		const Rectanglei filter_region = force_clip_to_self_border_box ? GetFilterRegion(BoxArea::Border, {})
+																	  : GetFilterRegion(BoxArea::Auto, filters);
+		render_manager->SetScissorRegion(filter_region.IntersectIfValid(render_manager->GetScissorRegion()));
 	};
 
 	if (render_stage == RenderStage::Enter)
@@ -253,16 +243,10 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 			// Narrow the scissor to the region the filters will actually use before pushing. A pushed layer only has
 			// to be transparent within the active scissor, and the render interface is free to clear just that much --
 			// but with the scissor still covering the whole window, as it does here by default, every filtered element
-			// costs a full-window clear. The region is the same one applied on the way out, before compositing, so
-			// nothing outside it is ever read back. The scissor is put back straight away: the element and its
+			// costs a full-window clear. It is the same region ApplyClippingRegion() applies on the way out, so
+			// nothing outside it is ever read back, and the scissor is put back straight away: the element and its
 			// children render under their own clipping, as before.
-			Rectanglef push_region = Rectanglef::MakeInvalid();
-			ElementUtilities::GetBoundingBox(push_region, element, BoxArea::Auto);
-			for (const auto& filter : filters)
-				filter.filter->ExtendInkOverflow(element, push_region);
-			Math::ExpandToPixelGrid(push_region);
-
-			const Rectanglei push_scissor = Rectanglei(push_region).IntersectIfValid(initial_scissor_region);
+			const Rectanglei push_scissor = GetFilterRegion(BoxArea::Auto, filters).IntersectIfValid(initial_scissor_region);
 			if (push_scissor.Valid())
 				render_manager->SetScissorRegion(push_scissor);
 
@@ -287,7 +271,7 @@ void ElementEffects::RenderEffects(RenderStage render_stage)
 			// a second composite and a resolve on every element with a backdrop filter.
 			ApplyClippingRegion(PropertyId::BackdropFilter);
 			render_manager->CompositeLayers(backdrop_source_layer, backdrop_destination_layer, BlendMode::Blend, filter_handles,
-				GetBackdropInputRegion());
+				GetFilterRegion(BoxArea::Border, backdrop_filters));
 			render_manager->SetScissorRegion(initial_scissor_region);
 		}
 	}

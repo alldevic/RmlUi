@@ -4,20 +4,16 @@
 #include <RmlUi/Core/Types.h>
 #include <SDL3/SDL.h>
 
-// How many samples the layers are rendered with; one turns multisampling off. A device that does not offer exactly
-// this many gets the nearest it does, preferring more to fewer. See SelectSampleCount().
+// How many samples the layers are rendered with; one turns multisampling off. A device that does not offer
+// exactly this many gets the nearest it does; see SelectSampleCount().
 #ifndef RMLUI_SDL_GPU_NUM_MSAA_SAMPLES
 	#define RMLUI_SDL_GPU_NUM_MSAA_SAMPLES 2
 #endif
 
-// Whether a multisampled layer may be read by a shader. That is what lets the resolve be drawn over a region, the way
-// the reference backend resolves with glBlitFramebuffer under glScissor; without it SDL can only resolve a layer
-// whole, as the store operation of a render pass, and compositing pays for the window rather than for the element.
-//
-// Every released SDL refuses to create a multisample texture with a read flag at all -- SDL_CreateGPUTexture asserts
-// on it -- so this cannot be probed at runtime, and libsdl-org/SDL#15838, which lifts the restriction, is not in a
-// release yet. Hence a build-time switch, defaulting to what every released SDL can do. Once the change ships this
-// becomes a check on SDL_GetVersion() and the switch goes away.
+// Whether a multisampled layer may be read by a shader, which is what lets the resolve be drawn over a region
+// rather than covering the window. Every released SDL refuses to create such a texture at all, so this cannot
+// be probed at runtime: libsdl-org/SDL#15838 lifts the restriction and is not in a release yet. Once it ships
+// this becomes a check on SDL_GetVersion().
 #ifndef RMLUI_SDL_GPU_SHADER_RESOLVE
 	#define RMLUI_SDL_GPU_SHADER_RESOLVE 0
 #endif
@@ -29,18 +25,12 @@ public:
 
 	void Shutdown();
 
-	// Prepares the renderer to take rendering commands from RmlUi. Rendering goes to the renderer's own layers; the
-	// result is copied to the swapchain texture by EndFrame(). The size is the one the frame is laid out for, which
-	// is the window's size in pixels.
+	// Prepares the renderer to take rendering commands. Rendering goes to the renderer's own layers, and the size
+	// is the one the frame is laid out for, which is the window's size in pixels.
 	void BeginFrame(SDL_GPUCommandBuffer* command_buffer, uint32_t width, uint32_t height);
-	/*
-	    Takes the swapchain texture, copies the base layer into it and returns the command buffer to submit -- which
-	    is not necessarily the one BeginFrame() was given: a frame may be sent in several buffers, and the ones before
-	    the last have already gone. Null when there is nothing to submit.
-
-	    The swapchain texture is taken here rather than before recording because it belongs to whichever buffer takes
-	    it, and that buffer is presented when it is submitted -- so it has to be the last one of the frame.
-	*/
+	// Copies the base layer into the swapchain texture and returns the command buffer to submit, which is not
+	// necessarily the one BeginFrame() was given. Null when there is nothing to submit. The swapchain texture is
+	// taken here because it belongs to whichever buffer takes it, and that buffer has to be the frame's last.
 	SDL_GPUCommandBuffer* EndFrame();
 
 	// Rows come back bottom-up. Must be called after EndFrame() and before the next BeginFrame().
@@ -83,58 +73,46 @@ public:
 
 private:
 	static constexpr uint32_t geometry_block_size = 1024 * 1024;
-	// Space given up by a released mesh is held back this long: the GPU may still be reading it, and a range inside a
-	// shared block cannot be cycled the way a buffer of its own could. Two frames may be in flight, so the third is safe.
+	// Space given up by a released mesh is held back this long: the GPU may still be reading it. Two frames may be
+	// in flight, so the third is safe.
 	static constexpr int frames_before_reuse = 3;
 	static constexpr int geometry_retention_frames = 120;
 	static constexpr uint32_t max_pending_upload_bytes = 8 * 1024 * 1024;
-	// What the layers are made of where the window's own format cannot be used; see SelectLayerFormat().
+	// Used where the window's own format cannot be; see SelectLayerFormat().
 	static constexpr SDL_GPUTextureFormat default_layer_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-	// The format of the pixels RmlUi hands to GenerateTexture(). Deliberately separate from the layers, which follow
-	// the window: one describes what the application uploads, the other what the renderer draws into.
+	// The format of the pixels RmlUi hands to GenerateTexture(), which is not what the layers are made of.
 	static constexpr SDL_GPUTextureFormat content_format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-	// Filters read and write the first two in turn, a blurred drop shadow needs a third while its own blur runs, and
-	// the fourth holds the image saved by SaveLayerAsMaskImage().
+	// Filters read and write the first two in turn, a blurred drop shadow needs a third while its own blur runs,
+	// and the fourth holds the image saved by SaveLayerAsMaskImage().
 	static constexpr int num_postprocess_targets = 4;
 	static constexpr int max_num_stops = 16;
 	static constexpr int max_num_stops_packed = (max_num_stops + 3) / 4;
-	// Mirrors BLUR_SIZE in RmlUi_SDL_GPU/shader_common.hlsli. The weights are symmetric, so only half plus the centre
-	// are sent.
+	// Mirrors BLUR_SIZE in RmlUi_SDL_GPU/shader_common.hlsli. The weights are symmetric, so only half are sent.
 	static constexpr int blur_size = 7;
 	static constexpr int blur_num_weights = (blur_size + 1) / 2;
-	// How deep clip masks may nest before the stencil runs out of room. Every Intersect raises the mask by one, so a
-	// generation has to keep this much space above it; past that the value clamps and the mask stops narrowing.
+	// How deep clip masks may nest before the stencil runs out of room; past that the mask stops narrowing.
 	static constexpr int max_clip_mask_depth = 64;
-	// The clip mask is not cleared between masks; each one takes a stencil value never used before instead. The
-	// buffer holds eight bits, so the supply runs out and the stencil has to be cleared for real. A Set arriving at
-	// or above this asks for that clear first, which is what keeps the reserve above it free.
+	// Each mask takes a stencil value never used before rather than clearing the buffer, and eight bits run out. A
+	// Set arriving at or above this clears for real first, which is what keeps the nesting reserve above it free.
 	static constexpr int max_stencil_generation = 0xFF - max_clip_mask_depth;
 
-	/*
-	    A transfer buffer, together with the awkward half of keeping one: a transfer buffer cannot be resized, so
-	    growing means letting the old one go and creating another. Both the geometry uploads and the texture uploads
-	    need that much; how large the new buffer should be they answer differently, and each works it out for itself.
-	*/
+	// A transfer buffer the geometry and the texture uploads both write into. It cannot be resized, so growing
+	// means creating another -- how large is left to the caller. Writes go one after another and the buffer is
+	// cycled only once the next no longer fits: writing past what the recorded copies read is what makes that safe.
 	struct TransferBuffer {
-		// Replaces the buffer with one of `new_capacity` bytes. Whatever was written into the old one goes with it,
-		// hence `used` starting over. False if no buffer could be created, leaving none at all.
+		// Whatever was written into the old buffer goes with it, hence `used` starting over.
 		bool Recreate(SDL_GPUDevice* device, uint32_t new_capacity);
 		void Release(SDL_GPUDevice* device);
 
 		SDL_GPUTransferBuffer* buffer = nullptr;
 		uint32_t capacity = 0;
-		// How much of it the writes since the last cycle have taken, for a caller that hands out slices rather than
-		// writing from the start.
+		// How far the writes since the last cycle have got, for a caller handing out slices.
 		uint32_t used = 0;
 	};
 
-	/*
-	    A few large GPU buffers with the meshes placed inside them, rather than a pair of buffers for every mesh: a
-	    draw reaches its own mesh through the first_index and vertex_offset arguments, and the buffers are bound once
-	    and stay bound. Binding is what this avoids -- SDL records the resource against the command buffer each time.
-
-	    Sizes and offsets are counted in units, one vertex or one index, since that is what a draw call addresses in.
-	*/
+	// A few large GPU buffers with the meshes placed inside them, rather than a pair of buffers per mesh: a draw
+	// reaches its own mesh through first_index and vertex_offset, and the buffers are bound once and stay bound.
+	// Sizes and offsets are counted in units, one vertex or one index, since that is what a draw addresses in.
 	class GeometryArena {
 	public:
 		struct Range {
@@ -233,11 +211,8 @@ private:
 		Rml::Matrix4f color_matrix;
 	};
 
-	/*
-	    HLSL packs a constant buffer into 16-byte rows: a member never straddles a row boundary, and an array element
-	    always starts one. Get this wrong and nothing fails loudly -- the shader compiles, the draw goes through, and
-	    the values are read from the wrong offsets. The static_asserts below check what can be checked.
-	*/
+	// HLSL packs a constant buffer into 16-byte rows: a member never straddles a row boundary, and an array element
+	// always starts one. Get this wrong and nothing fails loudly, so the static_asserts check what can be checked.
 	struct GradientUniforms {
 		Rml::Vector2f p;
 		Rml::Vector2f v;
@@ -264,7 +239,7 @@ private:
 	static_assert(sizeof(ColorMatrixUniforms) == 64, "ColorMatrixUniforms does not match the constant buffer of shader_frag_color_matrix.frag");
 
 	struct BlurUniforms {
-		// One row: the shader declares this a float4 and indexes it, so the weights have to be four to a row.
+		// One row: the shader declares this a float4 and indexes it.
 		float weights[blur_num_weights];
 		Rml::Vector2f tex_coord_min;
 		Rml::Vector2f tex_coord_max;
@@ -297,13 +272,10 @@ private:
 		int width = 0;
 		int height = 0;
 		SDL_GPUSampleCount sample_count = SDL_GPU_SAMPLECOUNT_1;
-		// Only the layers attach it: the postprocess passes neither test nor write the clip mask, and once the layers
-		// are multisampled the shared buffer no longer matches them in sample count anyway.
+		// Only the layers attach it: the postprocess passes neither test nor write the clip mask.
 		bool use_depth_stencil = false;
-		// What has been drawn into a postprocess target since it was last transparent everywhere, as a bounding
-		// rectangle. The regional resolve wipes this much rather than the whole target, which is the difference
-		// between clearing the element and clearing the window. Empty means the target holds nothing; a target just
-		// created holds whatever the allocation did, so it starts out dirty in full. Unused on the layers.
+		// What has been drawn into a postprocess target since it was last transparent, as a bounding rectangle; the
+		// regional resolve wipes this much rather than the whole target. A target just created is dirty in full.
 		Rml::Rectanglei dirty;
 	};
 
@@ -327,22 +299,19 @@ private:
 		const RenderTarget& GetPostprocessSecondary() { return EnsurePostprocess(1); }
 		const RenderTarget& GetPostprocessTertiary() { return EnsurePostprocess(2); }
 		const RenderTarget& GetBlendMask() { return EnsurePostprocess(3); }
-		// The tertiary target if something has already needed it, and null otherwise. Unlike the accessors above this
-		// one does not create it: a caller that merely prefers a third target should not be what brings a
-		// window-sized one into existence.
+		// The tertiary target if something has already needed it, and null otherwise: unlike the accessors above,
+		// this one does not bring a window-sized target into existence.
 		const RenderTarget* PeekPostprocessTertiary() const { return postprocess[2].color ? &postprocess[2] : nullptr; }
 		void SwapPostprocessPrimarySecondary();
 
-		// Records that `rect` of the postprocess target holding `texture` has been drawn into. Does nothing for a
-		// texture that is not one of them, which is how the layers are passed over.
+		// Does nothing for a texture that is not a postprocess target, which is how the layers are passed over.
 		void MarkPostprocessDirty(SDL_GPUTexture* texture, Rml::Rectanglei rect);
-		// What is left to wipe before the target can stand in for a transparent one. Empty if there is nothing.
-		Rml::Rectanglei GetPostprocessDirty(SDL_GPUTexture* texture) const;
-		// Says outright what the target now holds, for a caller that has just written or wiped it.
+		// What is left to wipe before the target can stand in for a transparent one.
+		Rml::Rectanglei GetPostprocessDirty(SDL_GPUTexture* texture);
 		void SetPostprocessDirty(SDL_GPUTexture* texture, Rml::Rectanglei rect);
 
-		// Created on first use: a document that renders no clip mask never needs it, and on multisampled layers it is
-		// megabytes. Null if it could not be created, which takes clip masks out of service until the next rebuild.
+		// Created on first use, and null if it could not be created, which takes clip masks out of service until the
+		// next rebuild.
 		SDL_GPUTexture* EnsureDepthStencil();
 		SDL_GPUTextureFormat GetDepthStencilFormat() const { return depth_stencil_format; }
 		SDL_GPUSampleCount GetSampleCount() const { return sample_count; }
@@ -355,6 +324,8 @@ private:
 		const RenderTarget& EnsurePostprocess(int index);
 		bool CreateTarget(RenderTarget& target, const char* debug_name, bool is_layer);
 		void DestroyTargets();
+		// The postprocess target `texture` belongs to, or null when it is none of them.
+		RenderTarget* FindPostprocess(SDL_GPUTexture* texture);
 
 		SDL_GPUDevice* device = nullptr;
 		int width = 0;
@@ -364,13 +335,12 @@ private:
 
 		int layers_size = 0;
 		Rml::Vector<RenderTarget> layers;
-		// A fixed array rather than a growing vector: callers hold on to several of these references at once, which a
-		// reallocation would invalidate.
+		// A fixed array rather than a vector: callers hold several of these references at once.
 		RenderTarget postprocess[num_postprocess_targets];
 
 		SDL_GPUTexture* depth_stencil = nullptr;
-		// INVALID while there is no stencil buffer to go with it. Kept apart from what the device supports so that a
-		// failed allocation only disables clip masks until the next rebuild, not for the life of the renderer.
+		// INVALID while there is no stencil buffer, so that a failed allocation only disables clip masks until the
+		// next rebuild.
 		SDL_GPUTextureFormat depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
 		SDL_GPUTextureFormat supported_depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
 	};
@@ -405,20 +375,17 @@ private:
 		BlendMask,
 		Blur,
 		DropShadow,
-		// Resolves a multisampled layer by reading its samples, which lets it be done over a region. Only usable
-		// where the SDL runtime allows a multisample texture to be read; see supports_shader_resolve.
+		// Resolves a multisampled layer by reading its samples, which lets it be done over a region.
 		Resolve,
 		Count,
 	};
 
-	// The pair of shaders a program is built from.
 	struct ProgramShaders {
 		ShaderId vertex = ShaderId::VertMain;
 		ShaderId fragment = ShaderId::FragColor;
 	};
 
-	// Rml::BlendMode covers the first two; Constant scales the source instead of blending it, which is the opacity
-	// filter.
+	// Rml::BlendMode covers the first two; Constant scales the source instead, which is the opacity filter.
 	enum class Blending : uint8_t { Blend, Replace, Constant };
 
 	enum class StencilMode : uint8_t {
@@ -446,12 +413,9 @@ private:
 		SDL_GPUGraphicsPipeline* pipeline = nullptr;
 	};
 
-	// Picks what the layers are made of, given what the window presents. Called once, before anything of that format
-	// exists, and never again: the pipelines carry the answer.
+	// Picks what the layers are made of, given what the window presents. Called once: the pipelines carry the answer.
 	static SDL_GPUTextureFormat SelectLayerFormat(SDL_GPUDevice* device, SDL_Window* window);
 
-	// What a Blending and a StencilMode mean to SDL, kept apart from the pipeline they are built into: both are
-	// tables of the API's own constants, and read as such once they are on their own.
 	static SDL_GPUColorTargetBlendState GetBlendState(Blending blend, bool writes_stencil);
 	static SDL_GPUDepthStencilState GetDepthStencilState(StencilMode stencil, bool writes_stencil);
 
@@ -466,25 +430,14 @@ private:
 	bool EnsureRenderPass(const RenderTarget& target, bool clear_color = false, bool clear_stencil = false);
 	void EndRenderPass();
 
-	// Transfers go into a command buffer of their own rather than the frame's, which keeps the frame's render pass
-	// open from the first draw to the last and lets textures be generated outside a frame. Ordering makes it safe:
-	// the upload buffer is submitted first, so its copies have run before any draw reads them.
-	//
-	// SDL GPU command buffers are thread-affine, and this one is acquired in CompileGeometry()/GenerateTexture() but
-	// submitted in EndFrame(), so every call into this interface must come from the same thread.
+	// Transfers go into a command buffer of their own, submitted before the frame's, so that the frame's render
+	// pass stays open from the first draw to the last and textures can be generated outside a frame. SDL GPU
+	// command buffers are thread-affine, so every call into this interface must come from the same thread.
 	bool EnsureUploadPass();
 	void SubmitUploads();
 
-	/*
-	    Sends what the frame has recorded so far and goes on recording into a fresh command buffer, so that the GPU
-	    can start on the beginning of a frame while the end of it is still being written. A frame recorded into a
-	    single buffer reaches the GPU only once the last draw has been recorded, and on a document that takes a long
-	    time to record that is milliseconds of device idling behind the CPU -- the reference backend has no such gap,
-	    because the OpenGL driver flushes batches of its own accord as the frame is recorded.
-	*/
 	void SubmitChunk();
-	// Takes the cut if enough recording time has gone by since the last one. Called where a cut is known to be safe:
-	// between two draws submitted by RmlUi, with nothing of the renderer's own half-done.
+	// Takes the cut where one is safe: between two draws submitted by RmlUi.
 	void MaybeSubmitChunk();
 
 	bool FlushGeometryUploads();
@@ -497,22 +450,18 @@ private:
 		uint8_t stencil_reference = 0;
 		SDL_GPUTexture* texture = nullptr;
 		SDL_GPUTexture* mask_texture = nullptr;
-		// The multisampled layer the resolve program reads. Bound as a storage texture rather than through a
-		// sampler, so it travels apart from `texture` and takes no sampler of its own.
+		// Bound as a storage texture rather than through a sampler, so it takes no sampler of its own.
 		SDL_GPUTexture* storage_texture = nullptr;
-		// Null to sample with the renderer's default sampler, which repeats. The postprocess passes clamp instead:
-		// they offset and scale texture coordinates, and a wrapped sample would come back from the far edge.
+		// Null to sample with the renderer's repeating sampler; the postprocess passes clamp instead.
 		SDL_GPUSampler* sampler = nullptr;
-		// Null to use the transform RmlUi last set. The renderer's own target-sized quad is in target coordinates and
-		// passes the plain projection instead. Only read by the programs whose vertex stage takes a transform.
+		// Null to use the transform RmlUi last set. Only read by the programs whose vertex stage takes one.
 		const Rml::Matrix4f* transform = nullptr;
 		Rml::Vector2f translation;
-		// Compared against what was last pushed: gradients and colour matrices repeat unchanged across a document, and
-		// a push costs more than the comparison.
+		// Compared against what was last pushed, since a document repeats the same gradient or colour matrix.
 		const void* fragment_uniforms = nullptr;
 		uint32_t fragment_uniforms_size = 0;
-		// Postprocess programs take one in place of the transform. The quad at the front is filled in by
-		// DrawPostprocessQuad(); a caller sets this only to add what follows, today the blur's texel offset.
+		// Postprocess programs take one in place of the transform; the quad at the front is filled in by
+		// DrawPostprocessQuad().
 		const void* vertex_uniforms = nullptr;
 		uint32_t vertex_uniforms_size = 0;
 	};
@@ -525,7 +474,7 @@ private:
 		Rml::Vector2f uv_scaling);
 	bool DrawPostprocessQuad(const RenderTarget& destination, const DrawState& state);
 	bool DrawTextureToTarget(const RenderTarget& destination, SDL_GPUTexture* source, Blending blend, StencilMode stencil = StencilMode::Off);
-bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
+	bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	bool ResolveTarget(SDL_GPUCommandBuffer* in_command_buffer, const RenderTarget& source, const RenderTarget& destination,
 		bool keep_samples);
 	void BlitRegion(const RenderTarget& destination, const RenderTarget& source, Rml::Rectanglei source_region,
@@ -548,12 +497,9 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	void ClearScissorOverride();
 
 	SDL_GPUDevice* device = nullptr;
-	// Kept for the format of the swapchain: the layers are made to agree with it, so that the frame is handed over
-	// without the blit that would otherwise convert between the two.
+	// Kept for the format of its swapchain, which the layers are made to agree with.
 	SDL_Window* window = nullptr;
-	// What the layers are made of. Decided once, at construction, from what the window presents; see
-	// SelectLayerFormat(). Everything the renderer draws into is of this format, pipelines included, so it must not
-	// change while any of them are alive.
+	// Decided once, at construction; everything the renderer draws into is of this format, pipelines included.
 	SDL_GPUTextureFormat layer_format = default_layer_format;
 
 	SDL_GPUShader* shaders[num_shaders] = {};
@@ -563,82 +509,48 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	SDL_GPUGraphicsPipeline* last_pipeline = nullptr;
 	bool last_pipeline_valid = false;
 	SDL_GPUTextureFormat pipelines_depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID;
-	// Takes clip masks out of service until the cache is rebuilt: testing against a mask whose writing pipeline is
-	// missing would hide the document.
+	// Takes clip masks out of service until the cache is rebuilt: a mask that cannot be written must not be tested.
 	bool stencil_pipelines_failed = false;
 
-	// Textures take slices of it one after another, and it is cycled only when the next no longer fits. That is what
-	// makes writing to it safe while recorded uploads are still in flight.
 	TransferBuffer texture_transfers;
 
-	// The postprocess passes use the clamping one: they sample outside the image on purpose, and a repeated sample
-	// would come back from the opposite edge.
+	// The postprocess passes use the clamping one: they sample outside the image on purpose.
 	SDL_GPUSampler* linear_sampler = nullptr;
 	SDL_GPUSampler* clamp_sampler = nullptr;
 
-	// Frame state, valid between BeginFrame() and EndFrame().
-	// The buffer being recorded into. Not necessarily the one BeginFrame() was given: a frame may be cut into
-	// several, and this then names the last of them. See SubmitChunk().
+	// Frame state, valid between BeginFrame() and EndFrame(). The command buffer is not necessarily the one
+	// BeginFrame() was given: a frame may be cut into several, and this then names the last of them.
 	SDL_GPUCommandBuffer* command_buffer = nullptr;
 	SDL_GPUTexture* swapchain_texture = nullptr;
 	uint32_t swapchain_width = 0;
 	uint32_t swapchain_height = 0;
 	int frame_index = 0;
-	// Set by BeginFrame() and cleared by EndFrame(). The backend skips both calls for a frame it cannot present, but
-	// still calls EndFrame(), which must then leave the layer stack alone.
+	// The backend skips both calls for a frame it cannot present, but still calls EndFrame(), which must then
+	// leave the layer stack alone.
 	bool frame_active = false;
-	// Whether EndFrame() left the finished frame in the postprocess primary target. It does when it had to resolve
-	// there to reach the swapchain, and then it also drops the layer's samples -- so this is both what lets
-	// CaptureScreen() read the frame without resolving again and what tells it that resolving again is not an option.
+	// Whether EndFrame() left the finished frame in the postprocess primary target, which is both what lets
+	// CaptureScreen() read it without resolving again and what tells it that resolving again is not an option.
 	bool frame_resolved_into_postprocess = false;
 
-	/*
-	    How much recording time to let pass before cutting the frame into another command buffer, in seconds, or zero
-	    to record it whole. Overridable through RMLUI_SDL_GPU_CHUNK_MS at construction; see SubmitChunk().
-
-	    One millisecond, because that is about what a submission costs on a loaded device, so a cut has to have at
-	    least that much recording behind it before it can have bought anything. Measured: on `filters` the interval
-	    is flat from half a millisecond to one and a half and falls away by four.
-
-	    Recording time rather than a number of draws, because that is what decides whether a cut pays. A cut buys the
-	    GPU whatever it can do while the rest of the frame is being recorded, and costs one command buffer
-	    submission, which on a loaded device is around a millisecond of CPU -- see .docs/experiments.md. So a cut is
-	    worth taking only where there is at least that much recording left to hide work behind, and a draw count says
-	    nothing about that: `filters` records at eight microseconds a draw and `boxes` at less than one.
-	*/
+	// How much recording time to let pass before cutting the frame into another command buffer, in seconds, or
+	// zero to record it whole; see SubmitChunk(). Overridable through RMLUI_SDL_GPU_CHUNK_MS at construction.
 	double chunk_interval = 0.001;
-	// When the frame and the current chunk started recording, on the performance counter, and how often to look at
-	// the clock. A read is cheap but not free, and a frame of `boxes` issues 1726 draws.
+	// When the frame and the current chunk started recording, and how often to look at the clock.
 	Uint64 frame_start_ticks = 0;
 	Uint64 chunk_start_ticks = 0;
 	static constexpr int chunk_check_draw_mask = 63;
-	/*
-	    How much recording a cut has to have ahead of it to be worth taking, as a multiple of chunk_interval. This is
-	    the half of the decision that is easy to miss: a cut costs a submission whether or not anything comes of it,
-	    so one taken near the end of a frame pays the cost and buys almost no overlap. Three rather than one, because
-	    what is ahead is an estimate and the cost is not: at one, `radius` -- whose whole frame records in under three
-	    milliseconds -- took a cut that bought nothing and cost it 13% of its frame.
-	*/
+	// How much recording a cut has to have ahead of it, as a multiple of chunk_interval: one taken near the end of
+	// a frame pays for a submission and buys almost no overlap.
 	static constexpr int chunk_min_remaining_intervals = 3;
-	/*
-	    How long the last frame took to record, in seconds, and how much of the current one has gone into sending
-	    chunks. Frames of a document resemble one another closely enough for the last one to say how much recording
-	    this one has left.
-
-	    The submission time is subtracted because sending is not recording, and counting it would let cutting feed on
-	    itself: a frame that cut takes longer to record, which on its own would license the next frame to cut again.
-	    The correction is not exact -- some of what a submission costs surfaces in the recording that follows it
-	    rather than in the call itself -- which is the other reason the margin above is as wide as it is.
-	*/
+	// How long the last frame took to record, which says how much recording this one has left, and how much of
+	// this one has gone into sending chunks -- subtracted, or cutting would feed on itself.
 	double last_frame_record = 0.0;
 	double frame_submit_time = 0.0;
 	// What frame_num_draws stood at when the current chunk began; a chunk with nothing in it is not worth sending.
 	int chunk_start_draw = 0;
 
-	// Everything RmlUi asked for and has not given back. RmlUi releases each of them during Rml::Shutdown(), which
-	// clients call before shutting the backend down, so all four are zero by the time Shutdown() runs. A leak in a
-	// client that drives the interface itself, or in the interface, shows up there as a number instead of going
-	// unnoticed until the driver complains; a negative number is the same accounting seen from the other side.
+	// Everything RmlUi asked for and has not given back; all four are zero by the time Shutdown() runs, so a
+	// number there is a leak on one side or the other.
 	int live_geometry = 0;
 	int live_textures = 0;
 	int live_shaders = 0;
@@ -649,8 +561,7 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	SDL_GPUSampleCount active_sample_count = SDL_GPU_SAMPLECOUNT_1;
 	bool active_depth_stencil = false;
 
-	// So that redundant bindings and uniform pushes can be skipped. Bindings and scissor do not survive a pass; the
-	// uniforms belong to the command buffer, but re-pushing them along with the rest keeps one invalidation point.
+	// So that redundant bindings and uniform pushes can be skipped. Bindings and scissor do not survive a pass.
 	SDL_GPUGraphicsPipeline* bound_pipeline = nullptr;
 	SDL_GPUTexture* bound_texture = nullptr;
 	SDL_GPUTexture* bound_mask_texture = nullptr;
@@ -672,15 +583,12 @@ bool BlitLayerToPostprocessPrimary(const RenderTarget& layer);
 	SDL_Rect applied_scissor = {};
 	bool scissor_override_active = false;
 	Rml::Rectanglei scissor_override;
-	// The region compositing is reading from while it fills the postprocess target, where RmlUi has asked for one
-	// wider than the region it writes; see CompositeLayers(). Set only for the input half of a composite, which is
-	// what GetScissorRegion() looks at.
+	// The region compositing reads from where RmlUi asked for one wider than what it writes; see CompositeLayers().
 	bool composite_input_active = false;
 	Rml::Rectanglei composite_input_region;
 
 	bool clip_mask_enabled = false;
-	// Until a mask has been rendered, passes carry no stencil attachment: every pass loads and stores it, which on a
-	// multisampled layer is megabytes of traffic for a buffer nothing would read.
+	// Until a mask has been rendered, passes carry no stencil attachment: every pass loads and stores it.
 	bool frame_has_clip_mask = false;
 	uint8_t stencil_high_water = 0;
 	uint8_t stencil_test_value = 0;
